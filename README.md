@@ -1,5 +1,9 @@
 # hybrid — local-first LLM routing with frontier escalation
 
+<p align="center">
+  <img src="og.png" alt="hybrid: answer the easy 90% locally, escalate the 10% that earns it" width="840">
+</p>
+
 Answer the easy majority of your LLM queries on a **small local model** (free,
 private, fast); escalate only the genuinely hard ones to a **frontier model**.
 Most of what you ask an LLM is easy — facts, rewrites, simple Q&A — and a small
@@ -25,6 +29,47 @@ query → router ─┬─ rule: hard category (code/proof/puzzle/powers) ─▶
    no single right answer, so the verify step would mis-fire on valid variation.
 3. **Verify-then-escalate** for everything else: the local model answers a few
    times; *unanimous* → confident (keep local), otherwise → uncertain (escalate).
+
+## What a run looks like
+
+`python hybrid.py --demo` on a GPU-less 2013 desktop — Qwen2.5-3B local; the
+frontier tier here was Claude via a local OpenAI-compatible proxy (point
+`FRONTIER_*` at your own). Answers are truncated to one line by `--demo`:
+
+```text
+ #  ROUTE     why                         lat  query
+--------------------------------------------------------------------------------------------
+ 1  LOCAL     self-consistent 3/3        7.4s  What is the capital of Japan?
+     -> Tokyo
+ 2  LOCAL     self-consistent 3/3        3.1s  What is 47 times 19?
+     -> 893
+ 3  LOCAL     self-consistent 3/3        9.3s  Define photosynthesis in one sentence.
+     -> Photosynthesis is the process by which plants convert light energy into chemical energy stored in glucose.
+ 4  LOCAL     open-ended (local ok)      2.2s  Rewrite 'hey can u send me that file' mo
+     -> "Could you kindly send me the file?"
+ 5  LOCAL     self-consistent 3/3        6.3s  A bat and a ball cost $1.10 total. The b
+     -> The ball costs $0.05.
+ 6  LOCAL     self-consistent 3/3        6.6s  If a chicken and a half lays an egg and
+     -> One chicken would lay 1 egg in one day.
+ 7  ESCALATE  rule: hard category        6.8s  What is 17 to the power of 4?
+     -> 17⁴ = 83,521   (17² = 289, 289² = 83,521)
+ 8  ESCALATE  rule: hard category        9.8s  Prove that the square root of 2 is irrat
+     -> Proof by contradiction. Assume √2 is rational, in lowest terms...
+ 9  ESCALATE  rule: hard category       24.7s  Write a Python function that returns the
+     -> Expand-around-center: treat each char (and gap) as a palindrome center...
+10  ESCALATE  rule: hard category       12.3s  I have a 3-liter and a 5-liter jug and u
+     -> Fill the 5, pour into the 3, empty the 3, pour the remaining 2 in...
+--------------------------------------------------------------------------------------------
+LOCAL:     6/10 (60%)  avg 5.8s   free / private
+ESCALATED: 4/10 (40%)  avg 13.4s   frontier (Claude, via a local proxy)
+```
+
+**Row 6 is the limit, live.** The chicken-and-a-half trap isn't a rule-flagged
+category, so it took the verify path — and the 3B agreed with itself **3/3 on the
+intuitive wrong answer** ("1 egg"; it's actually ⅔). Confident, consistent, wrong.
+Meanwhile "17⁴" *was* rule-flagged, so it escalated and came back right (83,521 —
+not the 3B's confident "6859"). What the rules catch versus what slips through the
+verifier is the whole finding below.
 
 ## Run
 
