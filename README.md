@@ -144,7 +144,6 @@ Part of **[Own Your Stack](https://github.com/askalf)** — open tools for ownin
 - **[hybrid](https://github.com/askalf/hybrid)** — own your inference _(you are here)_
 - **[deepdive](https://github.com/askalf/deepdive)** — own your research
 - **[hands](https://github.com/askalf/hands)** — own your computer-use
-- **[agent](https://github.com/askalf/agent)** — own your fleet
 - **[browser-bridge](https://github.com/askalf/browser-bridge)** — own your browser
 - **[warden](https://github.com/askalf/warden)** — own your agent security
 - **[canon](https://github.com/askalf/canon)** — own your agent skills
