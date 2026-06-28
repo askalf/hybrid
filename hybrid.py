@@ -2,26 +2,36 @@
 """
 hybrid — local-first LLM router with frontier escalation.
 
-  EASY queries -> a small local model (Ollama)                  free, private, fast
-  HARD queries -> a frontier model (any OpenAI-compatible API)  quality where it counts
+  EASY queries  -> a small local model (Ollama)                  free, private, fast
+  EXACT queries -> a deterministic Python oracle                 free, instant, correct
+  HARD queries  -> a frontier model (any OpenAI-compatible API)  quality where it counts
 
-The router decides per query: known-hard categories (code / proofs / puzzles /
-big math) escalate by rule; open-ended / creative tasks stay local; everything
-else runs through a self-consistency check and escalates only when the local
-model disagrees with itself.
+The hard part of local-first routing isn't sending the easy queries home — it's knowing
+when the cheap model is *confidently wrong*. A router built on the cheap model's own
+signals (classification, self-consistency) inherits its blind spots. hybrid's answer is a
+free verifier that is *stronger* than the model — Python's exact arithmetic — applied at
+two depths:
+
+  - SOLVE  closed-form arithmetic / unit conversions / %-change exactly, on-box (solver.py).
+  - VERIFY a numeric answer by having the model plug its numbers back into the problem's
+    relationships and re-deriving each exactly; a false check is a hard escalate (verify.py).
+
+Everything the oracle can't settle falls back to self-consistency, then the frontier.
 
   python hybrid.py "your question"   # route one query
   python hybrid.py --demo            # mixed test set + summary
 
 Config (env):
   OLLAMA_URL        default http://127.0.0.1:11434/api/generate
-  LOCAL_MODEL       default qwen2.5:3b
+  LOCAL_MODEL       default qwen2.5:7b
   FRONTIER_URL      default https://api.openai.com/v1/chat/completions  (any OpenAI-compatible endpoint)
   FRONTIER_API_KEY  required for escalation
   FRONTIER_MODEL    default gpt-4o
 """
 import sys, os, time, json, re, urllib.request
 from collections import Counter
+from solver import solve
+import verify
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # Windows cp1252 chokes on non-ASCII
@@ -29,12 +39,34 @@ except Exception:
     pass
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434/api/generate")
-LOCAL_MODEL = os.environ.get("LOCAL_MODEL", "qwen2.5:3b")
+LOCAL_MODEL = os.environ.get("LOCAL_MODEL", "qwen2.5:7b")
 FRONTIER_URL = os.environ.get("FRONTIER_URL", "https://api.openai.com/v1/chat/completions")
 FRONTIER_KEY = os.environ.get("FRONTIER_API_KEY", "")
 FRONTIER_MODEL = os.environ.get("FRONTIER_MODEL", "gpt-4o")
 
 CONCISE = "Answer directly and concisely - a number, a word, or one or two sentences, no working shown.\nQuestion: {q}"
+
+# Verify-the-local-answer prompt. The small model, asked for "VARS/CHECK", tends to write
+# symbolic algebra (`x + 1.00 = 1.10`) that never reduces to a number — so instead we ask it
+# to PLUG ITS OWN NUMBERS into the problem's relationships and write pure-numeric CHECK lines
+# the exact oracle can re-derive. "Transcribe the problem, no letters/units" is load-bearing:
+# the catch only works when a CHECK is the PROBLEM's constraint with the answer plugged in.
+VERIFY_PROMPT = (
+    "Answer the question, then verify your own answer by substitution.\n"
+    "Put the answer on its own line:\n"
+    "    ANSWER: <a number or one short sentence>\n"
+    "Then substitute YOUR numbers into the relationships the PROBLEM states and write each "
+    "as a line containing ONLY digits and + - * / ( ) — no letters, no variables, no units:\n"
+    "    CHECK: <numbers only> = <number>\n"
+    "    CHECK: <numbers only> = <number>\n"
+    "Each CHECK must restate a fact the PROBLEM gives, with your numbers plugged in. If the "
+    "answer is a single calculation, one CHECK containing it is enough.\n"
+    "Question: {q}")
+
+
+def _fmt(x):
+    return str(int(x)) if float(x).is_integer() else f"{x:.4g}"
+
 
 # Known-hard categories: a small model is unreliable here, so escalate by rule.
 _HARD = re.compile(
@@ -102,14 +134,42 @@ def local_consistency(query, k=3):
 
 
 def route(query):
+    # 0. exact oracle — closed-form arithmetic / conversions / %-change, free + correct.
+    exact = solve(query)
+    if exact is not None:
+        return {"route": "SOLVED", "why": "deterministic arithmetic",
+                "backend": "python (exact)", "answer": exact,
+                "router_s": 0.0, "answer_s": 0.0}
+    # 1. known-hard categories -> escalate by rule.
     if _HARD.search(query) or len(query) > 220:
         ans, dt = escalate(query)
         return {"route": "ESCALATE", "why": "rule: hard category", "backend": FRONTIER_MODEL,
                 "answer": ans, "router_s": 0.0, "answer_s": round(dt, 2)}
+    # 2. open-ended / creative -> keep local.
     if _OPEN.search(query):
         ans, dt = ollama(CONCISE.format(q=query), num_predict=200)
         return {"route": "LOCAL", "why": "open-ended (local ok)", "backend": LOCAL_MODEL,
                 "answer": ans, "router_s": 0.0, "answer_s": round(dt, 2)}
+    # 3. verify-the-local-answer (only when the query has a number — else the CALC prompt
+    #    makes the model bolt spurious arithmetic onto a factual answer). The model answers
+    #    and plugs its numbers into the problem's relationships; we re-derive each exactly.
+    if any(ch.isdigit() for ch in query):
+        raw, dt = ollama(VERIFY_PROMPT.format(q=query), num_predict=220, temperature=0.0)
+        status, claims = verify.verdict(raw)
+        if status == "wrong":
+            bad = next(c for c in claims if not c["ok"])
+            kind = "constraint violated" if re.search(r"[a-z]", bad["expr"], re.I) else "local math wrong"
+            esc, et = escalate(query)
+            return {"route": "ESCALATE",
+                    "why": f"{kind} ({bad['expr']}={_fmt(bad['claimed'])}≠{_fmt(bad['actual'])})",
+                    "backend": FRONTIER_MODEL, "answer": esc,
+                    "router_s": round(dt, 2), "answer_s": round(et, 2)}
+        if status == "checked":
+            answer = verify.answer_text(raw) or _fmt(claims[-1]["actual"])
+            kind = "constraints hold" if verify.has_constraint(claims) else "arithmetic checks"
+            return {"route": "LOCAL", "why": f"{kind} ({len(claims)} eqn)", "backend": LOCAL_MODEL,
+                    "answer": answer, "router_s": 0.0, "answer_s": round(dt, 2)}
+    # 4. everything else -> self-consistency decides.
     confident, best, agree, ct = local_consistency(query)
     if confident:
         return {"route": "LOCAL", "why": f"self-consistent {agree}/3", "backend": LOCAL_MODEL,
@@ -124,6 +184,10 @@ DEMO = [
     "What is 47 times 19?",
     "Define photosynthesis in one sentence.",
     "Rewrite 'hey can u send me that file' more formally.",
+    "How many feet in 3 miles?",
+    "A store sells notebooks at $12.50 each. How much do 7 notebooks cost?",
+    "A factory makes 1,847 widgets per day. How many widgets in 263 days?",
+    "A shirt costs $40 after a 20% discount. What was the original price?",
     "A bat and a ball cost $1.10 total. The bat costs $1.00 more than the ball. How much is the ball?",
     "If a chicken and a half lays an egg and a half in a day and a half, how many eggs does one chicken lay in one day?",
     "What is 17 to the power of 4?",
@@ -134,23 +198,28 @@ DEMO = [
 
 
 def demo():
-    print(f"{'#':>2}  {'ROUTE':<9} {'why':<24} {'lat':>6}  query")
-    print("-" * 92)
-    local = esc = 0
-    tlocal = tesc = 0.0
+    print(f"{'#':>2}  {'ROUTE':<9} {'why':<26} {'lat':>6}  query")
+    print("-" * 94)
+    solved = local = esc = 0
+    tsolved = tlocal = tesc = 0.0
     for i, q in enumerate(DEMO, 1):
         r = route(q)
         tot = r["router_s"] + r["answer_s"]
-        if r["route"] == "LOCAL":
+        if r["route"] == "SOLVED":
+            solved += 1; tsolved += tot
+        elif r["route"] == "LOCAL":
             local += 1; tlocal += tot
         else:
             esc += 1; tesc += tot
-        print(f"{i:>2}  {r['route']:<9} {r['why']:<24} {tot:>5.1f}s  {q[:40]}")
+        print(f"{i:>2}  {r['route']:<9} {r['why']:<26} {tot:>5.1f}s  {q[:40]}")
         print(f"     -> {r['answer'][:108].replace(chr(10), ' ')}")
     n = len(DEMO)
-    print("-" * 92)
-    print(f"LOCAL:     {local}/{n} ({100*local//n}%)  avg {tlocal/max(local,1):.1f}s   free / private")
+    on_box = solved + local
+    print("-" * 94)
+    print(f"SOLVED:    {solved}/{n} ({100*solved//n}%)  avg {tsolved/max(solved,1):.2f}s   python exact / free")
+    print(f"LOCAL:     {local}/{n} ({100*local//n}%)  avg {tlocal/max(local,1):.1f}s   {LOCAL_MODEL} / free / private")
     print(f"ESCALATED: {esc}/{n} ({100*esc//n}%)  avg {tesc/max(esc,1):.1f}s   frontier ({FRONTIER_MODEL})")
+    print(f"ON-BOX:    {on_box}/{n} ({100*on_box//n}%)  answered with no frontier call")
 
 
 if __name__ == "__main__":
