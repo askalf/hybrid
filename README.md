@@ -82,6 +82,24 @@ sample, so self-consistency would call it *unanimously confident*. The verifier 
 `1847 * 263` and escalates instead. **Arithmetic execution is where a small model stays
 wrong even when it reasons well — and exactly where a free exact oracle wins.**
 
+## Measured economics (`measure_routing.py`)
+
+On-box *query share* and *dollar share* are not the same number. The queries that escalate
+are the token-heavy ones — a proof, a code-gen — so routing saves less than the 75% on-box
+rate suggests. `measure_routing.py` prices every query's frontier cost: escalations at what
+they really cost, on-box answers at the counterfactual cost they avoided.
+
+```
+ON-BOX:               15/20 (75%) answered without a frontier call
+$ SAVED:              ~52% of frontier spend avoided  (not 75%)
+PER 1000 (this mix):  ~$2.86 all-frontier  ->  ~$1.37 hybrid
+```
+
+Three-quarters of *queries* stay home, but only about *half the dollars*: escalation
+correctly sends the few token-expensive hard problems to the frontier — which is the whole
+point, and the reason query-share overstates the savings. Measured against claude-sonnet-4-6
+list pricing ($3 / $15 per 1M); set `PRICE_IN_PER_M` / `PRICE_OUT_PER_M` for your own frontier.
+
 ## Run
 
 ```bash
@@ -98,6 +116,7 @@ python solver.py "how many feet in 3 miles"   # the deterministic tier alone -> 
 python test_solver.py                          # solver tests (50/50, no model needed)
 python test_verify.py                          # verifier tests (28/28, no model needed)
 python bench_router.py                         # full-router benchmark: on-box %, safety, catches
+python measure_routing.py                      # router economics: $ saved vs all-frontier (needs FRONTIER_API_KEY)
 python hybrid.py "your question"               # route one query
 python hybrid.py --demo                        # mixed test set + summary
 python server.py                               # OpenAI-compatible server on :8080 (model "hybrid")
@@ -153,6 +172,7 @@ without a frontier call remains open; `--demo` and `bench_router.py` keep the li
 - `test_solver.py` / `test_verify.py` — solver (50/50) and verifier (28/28) tests; no model needed
 - `bench_offline.py` — what the solver buys versus a no-solver router (no model needed)
 - `bench_router.py` — full-router benchmark: on-box rate, on-box safety, catches (frontier stubbed)
+- `measure_routing.py` — router economics: prices every query's frontier cost to show real $ saved
 - `server.py` — OpenAI-compatible front end
 
 ## License
