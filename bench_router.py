@@ -24,7 +24,7 @@ import hybrid
 hybrid.escalate = lambda q: ("[would escalate -> frontier]", 0.0)
 
 # (query, ground-truth answer or None if it SHOULD escalate, category)
-#   category: solved | factual | wordprob | catch | hard | trap
+#   category: solved | template | factual | wordprob | catch | hard | trap
 CASES = [
     # closed-form arithmetic + the widened oracle -> SOLVED, exact, free
     ("What is 47 times 19?", "893", "solved"),
@@ -34,18 +34,24 @@ CASES = [
     ("How many seconds in 90 minutes?", "5400", "solved"),
     ("What is 20% off 50?", "40", "solved"),
     ("What is half of 60?", "30", "solved"),
+    # shaped word problems -> the template transcriber: SOLVED exact, zero model calls.
+    # The first three were v1.1's "catch" cases — embedded products the local model got
+    # confidently WRONG and the verifier had to intercept. A recognized rate shape
+    # cannot be multiplied wrong, so the transcriber retires that class outright.
+    ("A factory makes 1,847 widgets per day. How many widgets in 263 days?", "485761", "template"),
+    ("A server processes 3,408 requests per minute. How many in 47 minutes?", "160176", "template"),
+    ("Each shipping container holds 1,728 units. How many units in 56 containers?", "96768", "template"),
+    ("A store sells notebooks at $12.50 each. How much do 7 notebooks cost?", "87.5", "template"),
+    ("A bat and a ball cost $1.10; the bat is $1.00 more than the ball. How much is the ball?", "0.05", "template"),
+    ("A shirt costs $40 after a 20% discount. What was the original price?", "50", "template"),
+    ("A number increased by 30% is 78. What is the number?", "60", "template"),
     # factual / open -> LOCAL
     ("What is the capital of Japan?", "tokyo", "factual"),
     ("What is the capital of France?", "paris", "factual"),
-    # word problems the local model solves + self-verifies -> LOCAL (checks hold)
-    ("A store sells notebooks at $12.50 each. How much do 7 notebooks cost?", "87.5", "wordprob"),
-    ("A bat and a ball cost $1.10; the bat is $1.00 more than the ball. How much is the ball?", "0.05", "wordprob"),
-    ("A shirt costs $40 after a 20% discount. What was the original price?", "50", "wordprob"),
-    ("A number increased by 30% is 78. What is the number?", "60", "wordprob"),
-    # confident-wrong embedded arithmetic -> should be CAUGHT (verify -> escalate)
-    ("A factory makes 1,847 widgets per day. How many widgets in 263 days?", "485761", "catch"),
-    ("A server processes 3,408 requests per minute. How many in 47 minutes?", "160176", "catch"),
-    ("Each shipping container holds 1,728 units. How many units in 56 containers?", "96768", "catch"),
+    # confident-wrong embedded arithmetic OFF the template shapes (an extra quantity
+    # makes the transcriber decline) -> the model tiers, where wrongness must be CAUGHT
+    ("A crate holds 1,728 units. 56 crates arrive and 3 are damaged. How many units are on the undamaged crates?", "91584", "catch"),
+    ("Each box weighs 23.7 kg. What is the total weight of 41 boxes plus a 12 kg pallet?", "983.7", "catch"),
     # known-hard -> ESCALATE by rule
     ("Prove that the square root of 2 is irrational.", None, "hard"),
     ("Write a Python function that returns the longest palindromic substring.", None, "hard"),
@@ -74,6 +80,9 @@ def correct(answer, truth):
 
 def main():
     onbox = served_wrong = caught = trap_miss = escalated = 0
+    tmpl_exact = 0
+    n_catch = sum(1 for _, _, c in CASES if c == "catch")
+    n_tmpl = sum(1 for _, _, c in CASES if c == "template")
     for q, truth, cat in CASES:
         r = hybrid.route(q)
         route, ans = r["route"], r["answer"]
@@ -87,6 +96,8 @@ def main():
             escalated += 1
             if cat == "catch":
                 caught += 1
+        if cat == "template" and route == "SOLVED" and ok:
+            tmpl_exact += 1
         if cat == "trap" and is_onbox and ok is False:
             trap_miss += 1
         flag = {True: "ok", False: "WRONG-SERVED", None: "(escalated)"}[ok]
@@ -97,7 +108,8 @@ def main():
     print(f"ON-BOX:        {onbox}/{n} ({100*onbox//n}%) answered without a frontier call")
     print(f"ON-BOX SAFETY: {onbox-served_wrong}/{onbox} on-box answers correct"
           f"  ({served_wrong} wrong answer(s) served locally)")
-    print(f"CATCHES:       {caught}/3 confident-wrong arithmetic intercepted -> escalated")
+    print(f"TEMPLATE:      {tmpl_exact}/{n_tmpl} shaped word problems answered exact, zero model calls")
+    print(f"CATCHES:       {caught}/{n_catch} confident-wrong arithmetic intercepted -> escalated")
     print(f"ESCALATED:     {escalated}/{n} routed to the frontier")
     print(f"HONEST LIMIT:  {trap_miss} setup trap(s) slipped through local + wrong (known boundary)")
 

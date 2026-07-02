@@ -13,6 +13,9 @@ free verifier that is *stronger* than the model — Python's exact arithmetic �
 three depths:
 
   - SOLVE  closed-form arithmetic / unit conversions / %-change exactly, on-box (solver.py).
+  - TEMPLATE a word problem whose SHAPE we recognize outright (rate x quantity, bat-and-ball
+    pairs, reverse-percentage, ...): deterministic transcription + exact closed form — no
+    model, no tokens, no latency, correct by construction (templates.py).
   - DERIVE a word problem's answer independently: the model transcribes the problem's
     relationships as equations, we solve the linear system exactly; a contradiction with
     the model's own answer is a hard escalate (equations.py).
@@ -46,9 +49,10 @@ import sys, os, time, json, re, urllib.request
 from collections import Counter
 from solver import solve
 import equations
+import templates
 import verify
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # Windows cp1252 chokes on non-ASCII
@@ -245,6 +249,16 @@ def _route(query, messages=None):
     if exact is not None:
         return {"route": "SOLVED", "why": "deterministic arithmetic",
                 "backend": "python (exact)", "answer": exact,
+                "router_s": 0.0, "answer_s": 0.0}
+    # 0.5. template transcriber — a word problem whose shape we recognize outright is
+    # transcribed deterministically and solved in closed form: no model, no tokens.
+    # Runs BEFORE the hard-category rule on purpose: a clean template parse is exact,
+    # so a stray rule keyword in the query ("...13.9 liters...") must not out-rank it.
+    tmpl = templates.solve(query)
+    if tmpl is not None:
+        val, shape = tmpl
+        return {"route": "SOLVED", "why": f"template: {shape}",
+                "backend": "python (exact)", "answer": val,
                 "router_s": 0.0, "answer_s": 0.0}
     # 1. known-hard categories -> escalate by rule.
     if _HARD.search(query) or len(query) > 220:
