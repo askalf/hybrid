@@ -68,6 +68,11 @@ DECLINES = [
     "What is the population of China times 2?",   # has 'times 2' but isn't closed-form
     "How many miles in 5 kilograms?",              # cross-dimension -> refuse to convert
     "How many widgets in 3 boxes?",                # unknown units -> decline
+    # mixed-unit quantities: two number-carrying units; matching either pair would
+    # silently drop the other (live-caught: served 10.16 for 5'4" -> cm). Decline.
+    "Convert 5 feet 4 inches to centimeters.",
+    "How many centimeters in 5 feet 4 inches?",
+    "1 hour 30 minutes in seconds",
     "What time is it?",
     "",
 ]

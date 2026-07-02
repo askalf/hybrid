@@ -254,6 +254,9 @@ _unit("vol", Fraction(3785411784, 1000000), "gallon", "gallons")            # US
 _CONV1 = re.compile(r"how many ([a-z]+)\s+(?:are\s+)?(?:there\s+)?in\s+\b(\d[\d,]*\.?\d*|a|an|one)\b\s*([a-z]+)", re.I)
 _CONV2 = re.compile(r"(?:convert\s+)?\b(\d[\d,]*\.?\d*|a|an|one)\b\s*([a-z]+)\s+(?:in|into|to)\s+([a-z]+)", re.I)
 
+# every "<number> <known-unit>" pair in the query — the mixed-quantity guard below
+_QTY_UNIT = re.compile(r"\b(\d[\d,]*\.?\d*|a|an|one)\s*([a-z]+)\b", re.I)
+
 
 def _fmt_frac(v):
     """Exact Fraction -> int string if whole, else a trimmed 6-place decimal."""
@@ -273,6 +276,12 @@ def _convert(n_str, u1, u2):
 
 def _try_convert(query):
     """Exact unit conversion if the query is unambiguously one, else None."""
+    # Mixed-quantity guard: "5 feet 4 inches" is TWO number-carrying units; either
+    # conversion pattern would match one pair and silently drop the other (live bug:
+    # "convert 5 feet 4 inches to centimeters" -> 10.16, the 5 feet vanished). More
+    # than one known unit with its own number -> not unambiguously one conversion.
+    if sum(1 for m in _QTY_UNIT.finditer(query) if m.group(2).lower() in _UNITS) > 1:
+        return None
     m = _CONV1.search(query)
     if m:                                     # groups: (u2, n, u1)
         return _convert(m.group(2), m.group(3), m.group(1))
