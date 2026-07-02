@@ -3,6 +3,39 @@
 All notable changes to hybrid are documented here. This project adheres to
 [Semantic Versioning](https://semver.org).
 
+## v1.2.0 — 2026-07-02
+
+Production hardening, part 1: the router now fails predictably, and the routing logic
+itself — not just the oracles — is under test and CI.
+
+### Failure policy
+
+- `ollama()` and `escalate()` raise a typed `BackendError` after retries instead of
+  crashing the query (local transport now retries once) — and an escalation failure is
+  no longer returned *as the answer string*: an error is always a structured
+  `route: ERROR` result, never answer-shaped text a caller could mistake for content.
+- `route()` never raises for a dead backend. Policy via env, read per-call:
+  - `HYBRID_ON_LOCAL_FAIL` — `escalate` (default): local model unreachable → send the
+    query to the frontier; or `error`.
+  - `HYBRID_ON_FRONTIER_FAIL` — `error` (default, honest): a query the router decided
+    needs the frontier fails explicitly rather than getting a silent local answer; or
+    `local`: availability-over-correctness, a plain local answer labelled `DEGRADED`
+    (including for queries whose local answer the verifier just refuted — documented,
+    opt-in).
+- `--demo` reports backend errors in their own `ERRORS` bucket instead of folding them
+  into escalations.
+
+### Tests + CI
+
+- `test_route.py` (new, 16 tests) — the router *plumbing* finally has coverage: tier
+  order (solve short-circuits; rules before oracles; derive before plug-back; vote
+  last), the quantitative gate (factual queries skip the oracle tiers, number-word
+  setups reach them), verdict→route mapping (mismatch/false-check escalate, exact
+  values served), and the full failure-policy matrix — all offline via scripted fake
+  backends.
+- GitHub Actions CI (`.github/workflows/test.yml`): compile + all 142 offline tests on
+  Python 3.10–3.13, every push and PR. Actions pinned by commit SHA. Badge in README.
+
 ## v1.1.1 — 2026-07-02
 
 Conservatism fix in the conversion oracle, found by adversarial stress testing against

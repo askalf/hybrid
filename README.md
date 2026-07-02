@@ -1,5 +1,7 @@
 # hybrid — local-first LLM routing with frontier escalation
 
+[![tests](https://github.com/askalf/hybrid/actions/workflows/test.yml/badge.svg)](https://github.com/askalf/hybrid/actions/workflows/test.yml)
+
 <p align="center">
   <img src="og.png" alt="hybrid: answer the easy majority locally, escalate the few that earn it" width="840">
 </p>
@@ -132,9 +134,10 @@ export FRONTIER_URL=https://api.openai.com/v1/chat/completions    # default; poi
 export FRONTIER_MODEL=gpt-4o                                      # default
 
 python solver.py "how many feet in 3 miles"   # the deterministic tier alone -> 15840
-python test_solver.py                          # solver tests (50/50, no model needed)
+python test_solver.py                          # solver tests (53/53, no model needed)
 python test_verify.py                          # verifier tests (28/28, no model needed)
 python test_equations.py                       # setup re-derivation tests (45/45, no model needed)
+python test_route.py                           # router plumbing + failure policy (16/16, no model needed)
 python bench_router.py                         # full-router benchmark: on-box %, safety, catches
 python measure_routing.py                      # router economics: $ saved vs all-frontier (needs FRONTIER_API_KEY)
 python hybrid.py "your question"               # route one query
@@ -157,9 +160,21 @@ escalation transparently and can see which tier answered.
 | `FRONTIER_API_KEY` | — | required for escalation |
 | `FRONTIER_MODEL` | `gpt-4o` | frontier model id |
 | `PORT` | `8080` | server.py listen port |
+| `HYBRID_ON_LOCAL_FAIL` | `escalate` | local backend down → `escalate` to the frontier, or `error` |
+| `HYBRID_ON_FRONTIER_FAIL` | `error` | frontier down → honest `error`, or `local` (degraded, unverified) |
 
 `FRONTIER_URL` is just an OpenAI-compatible chat endpoint — OpenAI, a local proxy, or your
 own gateway. The key only ever leaves your machine on an *escalated* query.
+
+### Failure policy
+
+A dead backend degrades predictably. If the **local model** is unreachable, queries
+escalate to the frontier (set `HYBRID_ON_LOCAL_FAIL=error` to fail them instead). If the
+**frontier** is unreachable, a query that earned it returns an explicit error — never a
+silently-substituted local answer. `HYBRID_ON_FRONTIER_FAIL=local` opts into
+availability-over-correctness: a plain local answer labelled `DEGRADED`, *including* for
+queries whose local answer the verifier just refuted — opt in knowingly. Either way a
+failure is a structured result (`route: ERROR`), never an answer-shaped string.
 
 ## The honest part (what this taught me)
 
@@ -201,7 +216,8 @@ the line keeps moving; it doesn't disappear.
 - `equations.py` — setup re-derivation: solve the model's transcribed equation system exactly
   (linear systems, Gaussian elimination over `Fraction`s); conservative
 - `verify.py` — verify-the-local-answer: re-derive the model's plugged-in checks exactly
-- `test_solver.py` / `test_verify.py` / `test_equations.py` — 50/50 + 28/28 + 45/45 tests; no model needed
+- `test_solver.py` / `test_verify.py` / `test_equations.py` / `test_route.py` — 142 tests
+  (oracles + router plumbing + failure policy); all offline, no model needed
 - `bench_offline.py` — what the solver buys versus a no-solver router (no model needed)
 - `bench_router.py` — full-router benchmark: on-box rate, on-box safety, catches (frontier stubbed)
 - `measure_routing.py` — router economics: prices every query's frontier cost to show real $ saved

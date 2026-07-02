@@ -30,6 +30,17 @@ Config (env):
   FRONTIER_URL      default https://api.openai.com/v1/chat/completions  (any OpenAI-compatible endpoint)
   FRONTIER_API_KEY  required for escalation
   FRONTIER_MODEL    default gpt-4o
+
+Failure policy (env) — a dead backend degrades predictably instead of crashing the query:
+  HYBRID_ON_LOCAL_FAIL     escalate (default) | error
+                           "escalate": the local model is unreachable -> send the query to
+                           the frontier rather than failing it.
+  HYBRID_ON_FRONTIER_FAIL  error (default) | local
+                           "error" is the honest default: a query the router decided needs
+                           the frontier gets an ERROR, never a silent local answer.
+                           "local" trades correctness for availability — it serves a plain
+                           local answer labelled degraded, INCLUDING for queries whose local
+                           answer the verifier just caught as wrong. Opt in knowingly.
 """
 import sys, os, time, json, re, urllib.request
 from collections import Counter
@@ -47,6 +58,16 @@ LOCAL_MODEL = os.environ.get("LOCAL_MODEL", "qwen2.5:7b")
 FRONTIER_URL = os.environ.get("FRONTIER_URL", "https://api.openai.com/v1/chat/completions")
 FRONTIER_KEY = os.environ.get("FRONTIER_API_KEY", "")
 FRONTIER_MODEL = os.environ.get("FRONTIER_MODEL", "gpt-4o")
+
+
+class BackendError(RuntimeError):
+    """A model backend failed after retries. `tier` is "local" or "frontier". Raised by
+    ollama()/escalate(); route() catches it and applies the failure policy, so callers
+    of route() never see an exception — they see a routed result or an ERROR result."""
+
+    def __init__(self, tier, detail):
+        super().__init__(detail)
+        self.tier = tier
 
 CONCISE = "Answer directly and concisely - a number, a word, or one or two sentences, no working shown.\nQuestion: {q}"
 
@@ -115,18 +136,30 @@ def _quantitative(q):
 
 
 def ollama(prompt, num_predict=256, temperature=0.0):
+    """One local-model call. Retries once (transports flake), then raises BackendError —
+    an answer string is ALWAYS a real model answer, never an error in disguise."""
     body = json.dumps({
         "model": LOCAL_MODEL, "prompt": prompt, "stream": False, "keep_alive": "5m",
         "options": {"num_predict": num_predict, "temperature": temperature},
     }).encode()
-    req = urllib.request.Request(OLLAMA_URL, data=body, headers={"content-type": "application/json"})
     t0 = time.time()
-    r = json.loads(urllib.request.urlopen(req, timeout=300).read())
-    return r.get("response", "").strip(), time.time() - t0
+    last = None
+    for attempt in (1, 2):
+        try:
+            req = urllib.request.Request(OLLAMA_URL, data=body,
+                                         headers={"content-type": "application/json"})
+            r = json.loads(urllib.request.urlopen(req, timeout=300).read())
+            return r.get("response", "").strip(), time.time() - t0
+        except Exception as e:
+            last = e
+            if attempt == 1:
+                time.sleep(1.0)
+    raise BackendError("local", f"{LOCAL_MODEL} at {OLLAMA_URL}: {last}")
 
 
 def escalate(query):
-    """Send to any OpenAI-compatible frontier endpoint (set FRONTIER_URL / _API_KEY / _MODEL)."""
+    """Send to any OpenAI-compatible frontier endpoint (set FRONTIER_URL / _API_KEY /
+    _MODEL). Raises BackendError on failure — same contract as ollama()."""
     body = json.dumps({
         "model": FRONTIER_MODEL,
         "messages": [{"role": "user", "content": query}],
@@ -141,7 +174,7 @@ def escalate(query):
         r = json.loads(urllib.request.urlopen(req, timeout=120).read())
         return r["choices"][0]["message"]["content"].strip(), time.time() - t0
     except Exception as e:
-        return f"[escalation failed: {e} - set FRONTIER_URL / FRONTIER_API_KEY / FRONTIER_MODEL]", time.time() - t0
+        raise BackendError("frontier", f"{FRONTIER_MODEL} at {FRONTIER_URL}: {e}")
 
 
 def _key(ans):
@@ -166,6 +199,34 @@ def local_consistency(query, k=3):
 
 
 def route(query):
+    """Route one query. Never raises for a dead backend — the failure policy (env,
+    read per-call so a live service can be re-tuned) turns a BackendError into either
+    a degraded route or an explicit ERROR result the caller can surface."""
+    try:
+        return _route(query)
+    except BackendError as e:
+        if e.tier == "local" and os.environ.get("HYBRID_ON_LOCAL_FAIL", "escalate") == "escalate":
+            try:
+                ans, dt = escalate(query)
+                return {"route": "ESCALATE", "why": "local backend down -> frontier",
+                        "backend": FRONTIER_MODEL, "answer": ans,
+                        "router_s": 0.0, "answer_s": round(dt, 2)}
+            except BackendError as e2:
+                e = e2                        # frontier is down too -> ERROR below
+        elif e.tier == "frontier" and os.environ.get("HYBRID_ON_FRONTIER_FAIL", "error") == "local":
+            try:
+                ans, dt = ollama(CONCISE.format(q=query), num_predict=200)
+                return {"route": "LOCAL", "why": "DEGRADED: frontier down, unverified local",
+                        "backend": LOCAL_MODEL, "answer": ans,
+                        "router_s": 0.0, "answer_s": round(dt, 2)}
+            except BackendError as e2:
+                e = e2
+        return {"route": "ERROR", "why": f"{e.tier} backend unavailable",
+                "backend": e.tier, "answer": f"[{e.tier} backend unavailable: {e}]",
+                "router_s": 0.0, "answer_s": 0.0, "error": True}
+
+
+def _route(query):
     # 0. exact oracle — closed-form arithmetic / conversions / %-change, free + correct.
     exact = solve(query)
     if exact is not None:
@@ -262,7 +323,7 @@ DEMO = [
 def demo():
     print(f"{'#':>2}  {'ROUTE':<9} {'why':<24} {'lat':>6}  query")
     print("-" * 92)
-    solved = local = esc = 0
+    solved = local = esc = err = 0
     tsolved = tlocal = tesc = 0.0
     for i, q in enumerate(DEMO, 1):
         r = route(q)
@@ -271,8 +332,10 @@ def demo():
             solved += 1; tsolved += tot
         elif r["route"] == "LOCAL":
             local += 1; tlocal += tot
-        else:
+        elif r["route"] == "ESCALATE":
             esc += 1; tesc += tot
+        else:
+            err += 1
         print(f"{i:>2}  {r['route']:<9} {r['why']:<24} {tot:>5.1f}s  {q[:40]}")
         print(f"     -> {r['answer'][:108].replace(chr(10), ' ')}")
     n = len(DEMO)
@@ -281,6 +344,8 @@ def demo():
     print(f"SOLVED:    {solved}/{n} ({100*solved//n}%)  avg {tsolved/max(solved,1):.2f}s   python exact / free")
     print(f"LOCAL:     {local}/{n} ({100*local//n}%)  avg {tlocal/max(local,1):.1f}s   {LOCAL_MODEL} / free / private")
     print(f"ESCALATED: {esc}/{n} ({100*esc//n}%)  avg {tesc/max(esc,1):.1f}s   frontier ({FRONTIER_MODEL})")
+    if err:
+        print(f"ERRORS:    {err}/{n}  (backend unavailable — check OLLAMA_URL / FRONTIER_* config)")
     print(f"ON-BOX:    {on_box}/{n} ({100*on_box//n}%)  answered with no frontier call")
 
 
