@@ -169,6 +169,40 @@ def main():
           code == 502 and body["error"]["type"] == "backend_unavailable"
           and body["x_hybrid"]["route"] == "ERROR", body.get("error", {}).get("type"))
 
+    # --- 4.5 answer cache (opt-in) ----------------------------------------------
+    os.environ["HYBRID_CACHE_TTL"] = "60"
+    CALLS.clear()
+    call("/v1/chat/completions", {"messages": [{"role": "user", "content": "cache me"}]})
+    code, body, _ = call("/v1/chat/completions",
+                         {"messages": [{"role": "user", "content": "cache me"}]})
+    check("cache: repeated single-turn query served from memory",
+          code == 200 and len(CALLS) == 1 and body["x_hybrid"].get("cached") is True
+          and body["choices"][0]["message"]["content"] == "the answer is 42",
+          f"route calls: {len(CALLS)}")
+
+    convo = [{"role": "system", "content": "be brief"},
+             {"role": "user", "content": "cache me"}]
+    CALLS.clear()
+    call("/v1/chat/completions", {"messages": convo})
+    call("/v1/chat/completions", {"messages": convo})
+    check("cache: multi-turn requests always re-route",
+          len(CALLS) == 2, f"route calls: {len(CALLS)}")
+
+    CALLS.clear()
+    call("/v1/chat/completions", {"messages": [{"role": "user", "content": "boom"}]})
+    call("/v1/chat/completions", {"messages": [{"role": "user", "content": "boom"}]})
+    check("cache: ERROR results are never cached",
+          len(CALLS) == 2, f"route calls: {len(CALLS)}")
+    os.environ.pop("HYBRID_CACHE_TTL")
+
+    CALLS.clear()
+    call("/v1/chat/completions", {"messages": [{"role": "user", "content": "no cache"}]})
+    code, body, _ = call("/v1/chat/completions",
+                         {"messages": [{"role": "user", "content": "no cache"}]})
+    check("cache: off by default (TTL unset -> every request routes)",
+          len(CALLS) == 2 and "cached" not in body["x_hybrid"],
+          f"route calls: {len(CALLS)}")
+
     # --- 5. observability ------------------------------------------------------
     call("/v1/chat/completions", {"messages": [{"role": "user", "content": "log me"}]})
     rec = last_log()

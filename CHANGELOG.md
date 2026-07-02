@@ -3,6 +3,36 @@
 All notable changes to hybrid are documented here. This project adheres to
 [Semantic Versioning](https://semver.org).
 
+## v1.6.0 — 2026-07-02
+
+Split local models + an answer cache — the other two latency levers that need no GPU.
+
+### Router
+
+- **`LOCAL_MODEL_FAST`** (default: `LOCAL_MODEL`, so nothing changes until you set it) —
+  a smaller model for the **vote and creative tiers only**. The live 3B experiment cut
+  both ways: llama3.2:3b was flawless on factual votes and rewrites at ~2x the speed
+  (measured 17.0 vs 8.3 tok/s — CPU decode scales with model bytes), but **tripled
+  wrong-served answers when allowed to transcribe** — it writes wrong-but-internally-
+  consistent equation systems the exact oracle then faithfully re-derives. So the split
+  is enforced in the router, not left to configuration discipline: the derive/verify
+  transcription tiers always use `LOCAL_MODEL`, and results report which model answered.
+
+### Server
+
+- **Answer cache** (`HYBRID_CACHE_TTL` seconds, default 0 = off; `HYBRID_CACHE_MAX`
+  entries, default 512, LRU) — a repeated single-turn query is served from memory in
+  ~0 ms with `x_hybrid.cached: true` and a `cached` mark in the decision log. Real
+  traffic repeats; a hit costs neither tokens nor memory bandwidth. Deliberately narrow:
+  multi-turn requests always re-route (the same last message can mean something else
+  mid-conversation), and `ERROR` / `DEGRADED` results are never cached.
+
+### Tests
+
+- `test_route.py` 19 → 21 (fast model on the vote tier; transcription pinned to
+  `LOCAL_MODEL`); `test_server.py` 18 → 22 (cache hit skips routing, multi-turn
+  bypass, ERROR never cached, off by default). **Suite: 221 → 227, all offline.**
+
 ## v1.5.0 — 2026-07-02
 
 The template transcriber — the fastest token is the one you never generate.
