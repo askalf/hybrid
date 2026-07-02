@@ -86,40 +86,45 @@ query → router ─┬─ solve:    arithmetic · unit conversion · %-change? 
    than self-consistency, which at temperature 0 just repeats the same wrong number.
 6. **Self-consistency** for the rest: answer a few times; unanimous → keep local, else escalate.
 
-## Measured (`bench_router.py`, 20-query labeled set, qwen2.5:7b)
+## Measured (`bench_router.py`, 22-query labeled set, qwen2.5:7b)
 
-The real router over a labeled mix — closed-form, conversions, factual, word problems,
-confident-wrong arithmetic, hard, and setup traps. Frontier escalation is stubbed, so the
-benchmark is free:
+The real router over a labeled mix — closed-form, conversions, shaped word problems,
+factual, off-template confident-wrong arithmetic, hard, and setup traps. Frontier
+escalation is stubbed, so the benchmark is free (measured live on an 8-core CPU box):
 
 ```
-ON-BOX:        14/20 (70%) answered without a frontier call
-ON-BOX SAFETY: 14/14 on-box answers correct        (ZERO wrong answers served)
-CATCHES:       3/3 confident-wrong products intercepted -> escalated
-ESCALATED:     6/20 routed to the frontier
+ON-BOX:        17/22 (77%) answered without a frontier call
+ON-BOX SAFETY: 17/17 on-box answers correct        (ZERO wrong answers served)
+TEMPLATE:      7/7 shaped word problems answered exact, zero model calls
+CATCHES:       2/2 confident-wrong arithmetic intercepted -> escalated
+ESCALATED:     5/22 routed to the frontier
 HONEST LIMIT:  0 setup traps slipped through local + wrong
 ```
 
-In v1.0.0 the same set came back 15/20 on-box but **13/15 correct** — both documented setup
-traps (chicken-and-a-half, Sally's-sisters) were served locally and *wrong*. v1.1.0's setup
-re-derivation tier moved both: on-box rate gives up five points because a query that used
-to be answered wrong now correctly escalates — and **on-box safety is the number to watch;
-serving a wrong answer locally is the cardinal sin**. A few of the rows, verbatim:
+The line has moved three times now. v1.0.0: 15/20 on-box but **13/15 correct** — both
+documented setup traps served locally and *wrong*. v1.1.0: zero wrong served — the setup
+re-derivation tier caught Sally's-sisters and solved chicken-and-a-half, trading on-box
+points for safety. v1.5.0 moves it again in the other direction: the shaped word problems
+— *including the confident-wrong products the verifier used to have to intercept* — are
+now answered exactly with **zero model calls and zero latency**, so the on-box rate goes
+back UP without giving back any safety. A few of the rows, verbatim:
 
 ```text
-SOLVED     How many feet in 3 miles?                 -> 15840          (exact, free)
-LOCAL      7 notebooks at $12.50                      -> $87.50         (checks hold)
-LOCAL      bat and ball, bat $1 more                  -> 0.05           (setup re-derived)
-LOCAL      chicken-and-a-half                         -> 0.67           (setup re-derived — WRONG-SERVED in v1.0.0)
-ESCALATE   1,847 widgets/day for 263 days             -> caught: 1847*263 = 485061 ≠ 485761
-ESCALATE   Sally's-sisters                            -> caught: its own equations contradict its answer (WRONG-SERVED in v1.0.0)
+SOLVED     How many feet in 3 miles?                  -> 15840    (exact, free)
+SOLVED     1,847 widgets/day for 263 days             -> 485761   (template: rate — v1.1 had to CATCH the model flubbing this; now it is answered, exactly, in 0 ms)
+SOLVED     bat and ball, bat $1 more                  -> 0.05     (template: sum-diff — the $0.10 trap answer is unproducible)
+LOCAL      chicken-and-a-half                         -> 0.67     (setup re-derived)
+ESCALATE   56 crates arrive, 3 damaged — units left?  -> caught: the extra quantity makes the template decline; the verifier catches the model's flubbed product
+ESCALATE   Sally's-sisters                            -> caught: its own equations contradict its answer
 ```
 
-The ESCALATE rows are the point: at temperature 0 the model states the same wrong product
-on every sample, so self-consistency would call it *unanimously confident* — and Sally's
-answer even arrives with a true-but-disconnected check that fools plug-back. The exact
-oracle re-derives instead of grading, and escalates both. **Where a small model stays
-confidently wrong even when it reasons well is exactly where a free exact oracle wins.**
+On a fresh **24-query holdout** (never seen by any tier — new numbers, new phrasings, new
+traps), the same build measured **22/24 on-box (92%)** with **11/24 answered in 0 ms**
+(solver + templates) and total wall time halved on the same box and mix (228 s → 106 s).
+The one wrong-served answer is the documented transcription-leak trap, which the
+templates correctly decline — the model-side limit is unchanged, just reached less often.
+**Where a small model stays confidently wrong even when it reasons well is exactly where
+a free exact oracle wins — and the strongest form of winning is never asking it.**
 
 ## Measured economics (`measure_routing.py`, v1.0.0 routing mix)
 

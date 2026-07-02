@@ -3,6 +3,67 @@
 All notable changes to hybrid are documented here. This project adheres to
 [Semantic Versioning](https://semver.org).
 
+## v1.5.0 — 2026-07-02
+
+The template transcriber — the fastest token is the one you never generate.
+
+### Why
+
+Two live findings drove this tier. First, latency: CPU decode is memory-bandwidth-bound
+(measured ~8 tok/s for a 7B on an 8-core box), so a routed word problem costs 5–40 s in
+generated tokens no CPU trick can speed up. Second, safety: an experiment swapping the
+local model for a smaller one (llama3.2:3b) tripled wrong-served answers — the weaker
+model writes *wrong but internally consistent* equation systems, and the oracle faithfully
+re-derives garbage. **Transcription is the one surface the exact oracle cannot check.**
+Both problems have the same fix: for the shapes that dominate everyday quantitative
+queries, take the model out of transcription entirely.
+
+### Router
+
+- **TEMPLATE** (`templates.py`) — five rigid word-problem shapes parsed deterministically
+  and solved in closed form over `Fraction`s: rate × quantity/time ("2,417 pages per hour
+  → 94 hours"), total + gap pairs (bat-and-ball), reverse-percentage ("costs $68 after a
+  15% discount"), plain shifts ("a number decreased by 12 is 39"), and two-price mixes
+  ("$9 kids / $14 adults → 3 kids + 2 adults"). Zero model calls, zero tokens, zero
+  latency; the answer is exact by construction. The confident-wrong-product class the
+  verifier used to have to *catch* (v1.0.0's headline) is now simply answered — a
+  recognized rate shape cannot be multiplied wrong.
+- Runs after `solver.py`, **before the hard-category rule**: a clean exact parse
+  out-ranks a stray rule keyword ("...13.9 liters..." no longer escalates a unit-rate
+  query the transcriber answers exactly).
+- **Ruthlessly conservative, by contract**: every number in the query must be consumed
+  by the shape's slots (the v1.1.1 mixed-unit lesson, promoted to a rule); number-words
+  ("half", "twice") outside a slot decline; declaration and question nouns must agree
+  (stemmed); money markers must be consistent; negatives and >4-number queries decline.
+  Set-logic riddles (Emma/Sally/Tom), work-rate traps, and exponential growth never
+  match — they fall through to the model tiers exactly as before.
+
+### Tests + bench
+
+- `test_templates.py` (new, 58 tests) — every shape against the live bench/holdout/stress
+  queries it retires, plus 30 must-decline traps and near-misses. Offline, like every
+  oracle suite. `test_route.py` 16 → 19 (template short-circuit, template-beats-hard-rule,
+  template-declines-fall-through). **Suite: 160 → 221, all offline.**
+- `bench_router.py` — the three v1.1 "catch" products are recategorized `template` (they
+  are now answered exactly on-box instead of escalated); two new catch cases carry an
+  extra quantity so the transcriber declines and the verify tier stays honestly measured;
+  new `TEMPLATE` summary metric; dynamic denominators.
+
+### Measured (qwen2.5:7b, 8-core CPU box, frontier stubbed)
+
+- Labeled bench (now 22 cases): **17/22 on-box (77%), 17/17 correct — zero wrong
+  served**, 7/7 template shapes exact with zero model calls, 2/2 off-template
+  confident-wrong products still caught by the verifier, both setup traps still handled
+  (chicken solved + verified, Sally caught).
+- Fresh 24-query holdout (never seen by any tier): **22/24 on-box (92%)**, **11/24
+  answered in 0 ms** (solver + templates), wall time **228 s → 106 s** on the same box
+  and mix. The one wrong-served answer remains the documented transcription-leak trap
+  (a sisters-riddle variant), which the templates correctly decline — the model-side
+  limit is unchanged, just reached less often.
+- The movie-tickets case shows the ordering paying off twice: v1.4.0 caught the local
+  model's wrong total (60) by derive-mismatch and escalated — correct, but slow and a
+  frontier call. v1.5.0 answers 55 exactly, for free.
+
 ## v1.4.0 — 2026-07-02
 
 Production hardening, part 3: installable, deployable, publishable.
