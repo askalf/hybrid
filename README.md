@@ -20,7 +20,7 @@ The hard part isn't routing the easy queries home — it's knowing when the chea
 **confidently wrong**. A router built on the cheap model's own signals (classification,
 self-consistency) inherits its blind spots: it can't tell confident-and-right from
 confident-and-wrong. hybrid's answer is a **free verifier that is stronger than the
-model** — Python's exact arithmetic — applied at two depths.
+model** — Python's exact arithmetic — applied at three depths.
 
 ## How it routes
 
@@ -28,7 +28,12 @@ model** — Python's exact arithmetic — applied at two depths.
 query → router ─┬─ solve:   arithmetic · unit conversion · %-change? ▶ SOLVED  (python, exact, free)
                 ├─ rule:    hard category (code/proof/puzzle) ────────▶ ESCALATE
                 ├─ rule:    open-ended (rewrite/summarize) ───────────▶ LOCAL
-                ├─ verify:  has a number? local answers + plugs its
+                ├─ derive:  quantitative? the model transcribes the
+                │             problem's relationships as EQUATIONS;
+                │             we solve the linear system ourselves,
+                │             exactly ─▶ LOCAL if it re-derives the model's answer,
+                │                        ESCALATE if it contradicts it
+                ├─ verify:  not derivable? local answers + plugs its
                 │             numbers into the problem's relationships;
                 │             re-derive each exactly ─▶ LOCAL if every check holds,
                 │                                       ESCALATE if any is false
@@ -42,12 +47,24 @@ query → router ─┬─ solve:   arithmetic · unit conversion · %-change? �
    by construction. Strictly conservative — anything that doesn't reduce cleanly falls through.
 1. **Category rules** escalate domains a small model is *known* to fail (code, proofs, puzzles).
 2. **Open-ended rules** keep creative tasks (rewrite, summarize) local — no single right answer.
-3. **Verify-the-local-answer** (`verify.py`) — for any query with a number, the local model
+3. **Setup re-derivation** (`equations.py`, new in v1.1.0) — for any *quantitative* query (a
+   digit, or two number-words: "a chicken and **a half** lays an egg and **a half**…"), the
+   model **transcribes the problem's relationships as equations** over named unknowns —
+   transcription is an easier skill than solving — and we solve the linear system ourselves,
+   by exact Gaussian elimination over `Fraction`s. An answer its own transcription contradicts
+   is a **hard escalate** (the model mis-solved its own setup); a re-derived match stays local
+   in *one* call where self-consistency needs three. Runs *before* plug-back because a
+   derivation produces its **own** value instead of grading the model's checks — so a
+   tautology can't fool it (live: the 7B "verified" its wrong Sally's-sisters answer with
+   `CHECK: 3 + 3 - 1 = 5 / 2 * 2` — true, and disconnected from the problem). Strictly
+   conservative: nonlinear, inconsistent, or underdetermined systems fall through rather
+   than guess.
+4. **Verify-the-local-answer** (`verify.py`) — when nothing was derivable, the local model
    answers and **plugs its own numbers back into the problem's relationships**, writing
    pure-numeric checks we re-derive exactly. A false check is a **hard escalate** (the answer
    is provably inconsistent with the problem); all-checks-hold stays local. Strictly stronger
    than self-consistency, which at temperature 0 just repeats the same wrong number.
-4. **Self-consistency** for the rest: answer a few times; unanimous → keep local, else escalate.
+5. **Self-consistency** for the rest: answer a few times; unanimous → keep local, else escalate.
 
 ## Measured (`bench_router.py`, 20-query labeled set, qwen2.5:7b)
 
@@ -56,33 +73,35 @@ confident-wrong arithmetic, hard, and setup traps. Frontier escalation is stubbe
 benchmark is free:
 
 ```
-ON-BOX:        15/20 (75%) answered without a frontier call
-ON-BOX SAFETY: 13/15 on-box answers correct        (the 2 wrong are the setup traps below)
+ON-BOX:        14/20 (70%) answered without a frontier call
+ON-BOX SAFETY: 14/14 on-box answers correct        (ZERO wrong answers served)
 CATCHES:       3/3 confident-wrong products intercepted -> escalated
-ESCALATED:     5/20 routed to the frontier
-HONEST LIMIT:  2 setup traps slipped through local + wrong (known boundary)
+ESCALATED:     6/20 routed to the frontier
+HONEST LIMIT:  0 setup traps slipped through local + wrong
 ```
 
-Three-quarters answered free, and **the only wrong answers served on-box are two documented
-setup traps** (chicken-and-a-half, Sally's-sisters). Every other on-box answer is correct,
-and all three confident-wrong multiplications were caught and escalated. A few of the rows,
-verbatim:
+In v1.0.0 the same set came back 15/20 on-box but **13/15 correct** — both documented setup
+traps (chicken-and-a-half, Sally's-sisters) were served locally and *wrong*. v1.1.0's setup
+re-derivation tier moved both: on-box rate gives up five points because a query that used
+to be answered wrong now correctly escalates — and **on-box safety is the number to watch;
+serving a wrong answer locally is the cardinal sin**. A few of the rows, verbatim:
 
 ```text
 SOLVED     How many feet in 3 miles?                 -> 15840          (exact, free)
-SOLVED     What is 20% off 50?                       -> 40             (exact, free)
 LOCAL      7 notebooks at $12.50                      -> $87.50         (checks hold)
-LOCAL      bat and ball, bat $1 more                  -> 0.05           (0.05+1.00=1.05; 1.05-0.05=1.00)
+LOCAL      bat and ball, bat $1 more                  -> 0.05           (setup re-derived)
+LOCAL      chicken-and-a-half                         -> 0.67           (setup re-derived — WRONG-SERVED in v1.0.0)
 ESCALATE   1,847 widgets/day for 263 days             -> caught: 1847*263 = 485061 ≠ 485761
-LOCAL      chicken-and-a-half                         -> "½ egg/day"    (WRONG — the honest limit)
+ESCALATE   Sally's-sisters                            -> caught: its own equations contradict its answer (WRONG-SERVED in v1.0.0)
 ```
 
-That ESCALATE row is the point: at temperature 0 the model states `485061` on every
-sample, so self-consistency would call it *unanimously confident*. The verifier re-derives
-`1847 * 263` and escalates instead. **Arithmetic execution is where a small model stays
-wrong even when it reasons well — and exactly where a free exact oracle wins.**
+The ESCALATE rows are the point: at temperature 0 the model states the same wrong product
+on every sample, so self-consistency would call it *unanimously confident* — and Sally's
+answer even arrives with a true-but-disconnected check that fools plug-back. The exact
+oracle re-derives instead of grading, and escalates both. **Where a small model stays
+confidently wrong even when it reasons well is exactly where a free exact oracle wins.**
 
-## Measured economics (`measure_routing.py`)
+## Measured economics (`measure_routing.py`, v1.0.0 routing mix)
 
 On-box *query share* and *dollar share* are not the same number. The queries that escalate
 are the token-heavy ones — a proof, a code-gen — so routing saves less than the 75% on-box
@@ -115,6 +134,7 @@ export FRONTIER_MODEL=gpt-4o                                      # default
 python solver.py "how many feet in 3 miles"   # the deterministic tier alone -> 15840
 python test_solver.py                          # solver tests (50/50, no model needed)
 python test_verify.py                          # verifier tests (28/28, no model needed)
+python test_equations.py                       # setup re-derivation tests (45/45, no model needed)
 python bench_router.py                         # full-router benchmark: on-box %, safety, catches
 python measure_routing.py                      # router economics: $ saved vs all-frontier (needs FRONTIER_API_KEY)
 python hybrid.py "your question"               # route one query
@@ -122,8 +142,8 @@ python hybrid.py --demo                        # mixed test set + summary
 python server.py                               # OpenAI-compatible server on :8080 (model "hybrid")
 ```
 
-The solver and verifier tiers (and their tests) need **nothing** — no model, no network —
-so they run and test anywhere. The server returns an `x_hybrid` field (route / why /
+The solver, verifier, and setup re-derivation tiers (and their tests) need **nothing** —
+no model, no network — so they run and test anywhere. The server returns an `x_hybrid` field (route / why /
 backend / latency), so any OpenAI client (Cursor, Cline, scripts) gets local-first +
 escalation transparently and can see which tier answered.
 
@@ -155,21 +175,33 @@ exact arithmetic. So the solver answers closed-form math outright, and the verif
 the model plug its numbers back into the problem and re-derives them — catching confident-wrong
 *embedded* arithmetic (live: 5/6 ugly products) that self-consistency waves through.
 
-**What still gets through — kept visible, not papered over.** The oracle checks the answer
-against the relationships the model *transcribes*; it cannot check the *setup*. A
-self-consistently-wrong setup (the chicken-and-a-half rate trap) slips through local and
-wrong, because the model's own check restates its own misreading. We even tested the obvious
-cheap escape — a *second* small model as an independent vote — and it shares the classic blind
-spots (both models miss the same famous traps) while over-escalating when the weaker one is
-merely vaguer. A second cheap model is still a cheap-model signal. Cracking wrong-*setup*
-without a frontier call remains open; `--demo` and `bench_router.py` keep the limit on screen.
+**The line moves — v1.1.0 cracked v1.0.0's documented traps.** v1.0.0 shipped with two
+setup traps served locally and wrong, kept visible in the benchmark as the honest limit.
+The setup re-derivation tier moved both: Sally's-sisters is **caught** (the model's own
+transcription `S = 3 * 2` contradicts its answer), and chicken-and-a-half comes back
+**right and verified** — the equation prompt doubles as chain-of-thought, so the model
+writes the rate correctly and we re-derive `2/3` exactly.
+
+**What still gets through — kept visible, not papered over.** The oracle solves the system
+the model *transcribes*; it cannot check the transcription against the *problem*. A
+misconception that leaks *into* the equations — a wrong rate written as if the problem
+stated it — re-derives the same wrong answer and sails through. And only linear systems are
+in reach: set-logic riddles and nonlinear setups fall through (conservative) rather than
+guess. So a passed derivation is labelled **"setup re-derived," never "correct."** We even
+tested the obvious cheap escape — a *second* small model as an independent vote — and it
+shares the classic blind spots (both models miss the same famous traps) while over-escalating
+when the weaker one is merely vaguer. A second cheap model is still a cheap-model signal.
+Cracking a faithfully-mis-transcribed setup needs a stronger *reasoner* (a frontier call) —
+the line keeps moving; it doesn't disappear.
 
 ## Files
 
 - `hybrid.py` — router + dispatch + `--demo`
 - `solver.py` — deterministic arithmetic + exact unit/percentage/multiple conversion (the SOLVED tier)
+- `equations.py` — setup re-derivation: solve the model's transcribed equation system exactly
+  (linear systems, Gaussian elimination over `Fraction`s); conservative
 - `verify.py` — verify-the-local-answer: re-derive the model's plugged-in checks exactly
-- `test_solver.py` / `test_verify.py` — solver (50/50) and verifier (28/28) tests; no model needed
+- `test_solver.py` / `test_verify.py` / `test_equations.py` — 50/50 + 28/28 + 45/45 tests; no model needed
 - `bench_offline.py` — what the solver buys versus a no-solver router (no model needed)
 - `bench_router.py` — full-router benchmark: on-box rate, on-box safety, catches (frontier stubbed)
 - `measure_routing.py` — router economics: prices every query's frontier cost to show real $ saved

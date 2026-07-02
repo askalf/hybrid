@@ -10,9 +10,12 @@ The hard part of local-first routing isn't sending the easy queries home — it'
 when the cheap model is *confidently wrong*. A router built on the cheap model's own
 signals (classification, self-consistency) inherits its blind spots. hybrid's answer is a
 free verifier that is *stronger* than the model — Python's exact arithmetic — applied at
-two depths:
+three depths:
 
   - SOLVE  closed-form arithmetic / unit conversions / %-change exactly, on-box (solver.py).
+  - DERIVE a word problem's answer independently: the model transcribes the problem's
+    relationships as equations, we solve the linear system exactly; a contradiction with
+    the model's own answer is a hard escalate (equations.py).
   - VERIFY a numeric answer by having the model plug its numbers back into the problem's
     relationships and re-deriving each exactly; a false check is a hard escalate (verify.py).
 
@@ -31,6 +34,7 @@ Config (env):
 import sys, os, time, json, re, urllib.request
 from collections import Counter
 from solver import solve
+import equations
 import verify
 
 try:
@@ -63,6 +67,22 @@ VERIFY_PROMPT = (
     "answer is a single calculation, one CHECK containing it is enough.\n"
     "Question: {q}")
 
+# Setup re-derivation prompt (see equations.py): when the numeric plug-back had nothing
+# checkable, ask the model to TRANSCRIBE the problem's relationships as equations over
+# named unknowns — transcription is an easier skill than solving — and we solve the
+# linear system ourselves, exactly, and compare against the model's answer. "From the
+# problem itself, not your solution" is load-bearing: an equation invented from the
+# model's own (possibly wrong) reasoning just re-derives the same mistake.
+SETUP_PROMPT = (
+    "Set the problem up as equations, then solve it.\n"
+    "First write each relationship the PROBLEM states as one equation line, using a short "
+    "one-word name for each unknown quantity and * for multiplication:\n"
+    "    EQN: <equation>\n"
+    "Every EQN must restate a fact from the problem itself, not a step of your solution.\n"
+    "Then give the answer, naming the unknown it is the value of:\n"
+    "    ANSWER: <name> = <number>\n"
+    "Question: {q}")
+
 
 def _fmt(x):
     return str(int(x)) if float(x).is_integer() else f"{x:.4g}"
@@ -80,6 +100,18 @@ _OPEN = re.compile(
     r"\b(rewrite|reword|rephrase|paraphrase|summari[sz]e|shorten|polish|"
     r"more formal|less formal|formally|casual|draft (a|an|me)|compose|"
     r"brainstorm|suggest|give me ideas)\b", re.I)
+
+_NUMBER_WORD = re.compile(
+    r"\d|\b(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
+    r"twenty|thirty|forty|fifty|hundred|thousand|half|third|quarter|dozen|"
+    r"twice|double|triple)\b", re.I)
+
+
+def _quantitative(q):
+    """Should the derive/verify tiers fire? A digit is enough; number-WORDS need two
+    mentions ('a chicken and a half ... an egg and a half') so a lone 'in one sentence'
+    doesn't send a factual query through two extra local calls."""
+    return any(ch.isdigit() for ch in q) or len(_NUMBER_WORD.findall(q)) >= 2
 
 
 def ollama(prompt, num_predict=256, temperature=0.0):
@@ -150,25 +182,55 @@ def route(query):
         ans, dt = ollama(CONCISE.format(q=query), num_predict=200)
         return {"route": "LOCAL", "why": "open-ended (local ok)", "backend": LOCAL_MODEL,
                 "answer": ans, "router_s": 0.0, "answer_s": round(dt, 2)}
-    # 3. verify-the-local-answer (only when the query has a number — else the CALC prompt
-    #    makes the model bolt spurious arithmetic onto a factual answer). The model answers
-    #    and plugs its numbers into the problem's relationships; we re-derive each exactly.
-    if any(ch.isdigit() for ch in query):
-        raw, dt = ollama(VERIFY_PROMPT.format(q=query), num_predict=220, temperature=0.0)
-        status, claims = verify.verdict(raw)
+    # 3. quantitative queries get the exact oracle, strongest signal first:
+    #    derive (independent re-derivation) > plug-back (consistency) > vote (agreement).
+    if _quantitative(query):
+        # setup re-derivation (equations.py): the model transcribes the problem's
+        # relationships as equations, we solve the linear system OURSELVES (exact
+        # Fractions, free) and compare to its answer. A mismatch means the model
+        # mis-solved its own transcription -> HARD escalate. This runs FIRST because
+        # plug-back can be fooled by a tautology (a true-but-disconnected check like
+        # `(1.5/1.5)*1 = 1` reads as "checked"); a derivation can't — it produces its
+        # own value for the answer instead of grading the model's checks.
+        raw, dt = ollama(SETUP_PROMPT.format(q=query), num_predict=220, temperature=0.0)
+        st, info = equations.verdict(raw)
+        if st == "mismatch":
+            esc, et = escalate(query)
+            return {"route": "ESCALATE",
+                    "why": (f"setup derives {info['var']}="
+                            f"{equations.fmt(info['derived'])}≠{_fmt(info['claimed'])}"),
+                    "backend": FRONTIER_MODEL, "answer": esc,
+                    "router_s": round(dt, 2), "answer_s": round(et, 2)}
+        if st == "derived":
+            # serve the value we RE-DERIVED (== the model's answer, but exact and clean —
+            # the model may have phrased its ANSWER line in LaTeX or prose)
+            return {"route": "LOCAL", "why": f"setup re-derived ({info['eqns']} eqn)",
+                    "backend": LOCAL_MODEL, "answer": equations.fmt(info["derived"]),
+                    "router_s": 0.0, "answer_s": round(dt, 2)}
+
+        # nothing derivable (no clean linear system) -> plug-back verify: the model
+        # answers and states its calculation; we re-check that arithmetic exactly. A
+        # false equation is a HARD escalate signal (the model's own stated math is
+        # wrong), not a vote. Correct arithmetic we trust. Nothing checkable -> vote.
+        raw2, dt2 = ollama(VERIFY_PROMPT.format(q=query), num_predict=220, temperature=0.0)
+        status, claims = verify.verdict(raw2)
         if status == "wrong":
             bad = next(c for c in claims if not c["ok"])
+            # a variable in the failed expr means it was a CHECK (the answer is inconsistent
+            # with a problem constraint); a bare expr means the model's own arithmetic is off.
             kind = "constraint violated" if re.search(r"[a-z]", bad["expr"], re.I) else "local math wrong"
             esc, et = escalate(query)
             return {"route": "ESCALATE",
                     "why": f"{kind} ({bad['expr']}={_fmt(bad['claimed'])}≠{_fmt(bad['actual'])})",
                     "backend": FRONTIER_MODEL, "answer": esc,
-                    "router_s": round(dt, 2), "answer_s": round(et, 2)}
+                    "router_s": round(dt + dt2, 2), "answer_s": round(et, 2)}
         if status == "checked":
-            answer = verify.answer_text(raw) or _fmt(claims[-1]["actual"])
+            # the model may have put the value only in the working lines; show the answer
+            answer = verify.answer_text(raw2) or _fmt(claims[-1]["actual"])
             kind = "constraints hold" if verify.has_constraint(claims) else "arithmetic checks"
-            return {"route": "LOCAL", "why": f"{kind} ({len(claims)} eqn)", "backend": LOCAL_MODEL,
-                    "answer": answer, "router_s": 0.0, "answer_s": round(dt, 2)}
+            return {"route": "LOCAL", "why": f"{kind} ({len(claims)} eqn)",
+                    "backend": LOCAL_MODEL, "answer": answer,
+                    "router_s": round(dt, 2), "answer_s": round(dt2, 2)}
     # 4. everything else -> self-consistency decides.
     confident, best, agree, ct = local_consistency(query)
     if confident:
@@ -184,11 +246,11 @@ DEMO = [
     "What is 47 times 19?",
     "Define photosynthesis in one sentence.",
     "Rewrite 'hey can u send me that file' more formally.",
-    "How many feet in 3 miles?",
+    "A bat and a ball cost $1.10 total. The bat costs $1.00 more than the ball. How much is the ball?",
     "A store sells notebooks at $12.50 each. How much do 7 notebooks cost?",
+    "Each crate weighs 23.7 kg. What do 41 crates weigh?",
     "A factory makes 1,847 widgets per day. How many widgets in 263 days?",
     "A shirt costs $40 after a 20% discount. What was the original price?",
-    "A bat and a ball cost $1.10 total. The bat costs $1.00 more than the ball. How much is the ball?",
     "If a chicken and a half lays an egg and a half in a day and a half, how many eggs does one chicken lay in one day?",
     "What is 17 to the power of 4?",
     "Prove that the square root of 2 is irrational.",
@@ -198,8 +260,8 @@ DEMO = [
 
 
 def demo():
-    print(f"{'#':>2}  {'ROUTE':<9} {'why':<26} {'lat':>6}  query")
-    print("-" * 94)
+    print(f"{'#':>2}  {'ROUTE':<9} {'why':<24} {'lat':>6}  query")
+    print("-" * 92)
     solved = local = esc = 0
     tsolved = tlocal = tesc = 0.0
     for i, q in enumerate(DEMO, 1):
@@ -211,11 +273,11 @@ def demo():
             local += 1; tlocal += tot
         else:
             esc += 1; tesc += tot
-        print(f"{i:>2}  {r['route']:<9} {r['why']:<26} {tot:>5.1f}s  {q[:40]}")
+        print(f"{i:>2}  {r['route']:<9} {r['why']:<24} {tot:>5.1f}s  {q[:40]}")
         print(f"     -> {r['answer'][:108].replace(chr(10), ' ')}")
     n = len(DEMO)
     on_box = solved + local
-    print("-" * 94)
+    print("-" * 92)
     print(f"SOLVED:    {solved}/{n} ({100*solved//n}%)  avg {tsolved/max(solved,1):.2f}s   python exact / free")
     print(f"LOCAL:     {local}/{n} ({100*local//n}%)  avg {tlocal/max(local,1):.1f}s   {LOCAL_MODEL} / free / private")
     print(f"ESCALATED: {esc}/{n} ({100*esc//n}%)  avg {tesc/max(esc,1):.1f}s   frontier ({FRONTIER_MODEL})")
