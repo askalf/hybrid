@@ -3,6 +3,51 @@
 All notable changes to hybrid are documented here. This project adheres to
 [Semantic Versioning](https://semver.org).
 
+## v1.3.0 — 2026-07-02
+
+Production hardening, part 2: the server grows the surface a real OpenAI client
+expects, and every request leaves an observable trail.
+
+### Server
+
+- **`stream: true` works (SSE).** OpenAI SDKs, Cursor, and Cline default to streaming;
+  the flag was previously ignored and clients got a body they weren't parsing. Now:
+  role delta → one content delta (the answer arrives whole — routing has to finish
+  before an answer exists; the verify tiers see it complete) → a stop chunk carrying
+  `x_hybrid` + `usage` → `data: [DONE]`.
+- **JSONL decision log.** One line per request — ts, route, why, backend, latency,
+  wall time, status, stream flag, sha256 prefix + length of the query — to stdout
+  (banner moved to stderr so stdout is pure JSONL) or `HYBRID_LOG` file. Query text
+  only with `HYBRID_LOG_QUERIES=1`: observability without logging user content by
+  default.
+- **Limits + honest errors.** Request-body cap (`HYBRID_MAX_BODY`, default 1 MiB →
+  413), content-length required (411), and a route `ERROR` (v1.2.0 failure policy)
+  maps to **502 with an OpenAI-shaped error object** + `x_hybrid` — an outage is never
+  a 200 with error-shaped content.
+- **Optional bearer auth.** `HYBRID_API_KEY` gates everything except `/health`
+  (constant-time compare); `HYBRID_HOST` binds beyond loopback deliberately.
+- **Protocol polish.** `usage` chars/4 estimates flagged `usage_estimated`, `/health`
+  with version, handler timeout so a stalled client releases its thread, version
+  headers scrubbed, multi-turn conversations accepted.
+- **Fix:** `SOLVED` answers were labelled `model: hybrid:frontier` in responses —
+  now `hybrid:local` (the solver is the most on-box tier there is).
+
+### Router
+
+- `route(query, messages=None)` — multi-turn passthrough: routing and the local tiers
+  always work on the last user message; an **escalated call carries the whole
+  conversation** to the frontier. The 1-arg `escalate()` stub contract (bench,
+  measure, tests) is preserved via an internal dispatch helper.
+- `__version__` — reported by `/health`, the server banner, and (soon) packaging.
+
+### Tests
+
+- `test_server.py` (new, 18 tests) — a real `ThreadingHTTPServer` on an ephemeral
+  loopback port against a faked `route()`: protocol round-trip, SSE shape (delta
+  chunks, `[DONE]`, stop reason, `x_hybrid` on the final chunk), multi-turn
+  passthrough, body cap, auth matrix, 502 mapping, and decision-log opt-in.
+  **Suite: 142 → 160, all offline.**
+
 ## v1.2.0 — 2026-07-02
 
 Production hardening, part 1: the router now fails predictably, and the routing logic

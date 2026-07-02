@@ -48,6 +48,8 @@ from solver import solve
 import equations
 import verify
 
+__version__ = "1.3.0"
+
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # Windows cp1252 chokes on non-ASCII
 except Exception:
@@ -157,12 +159,13 @@ def ollama(prompt, num_predict=256, temperature=0.0):
     raise BackendError("local", f"{LOCAL_MODEL} at {OLLAMA_URL}: {last}")
 
 
-def escalate(query):
+def escalate(query, messages=None):
     """Send to any OpenAI-compatible frontier endpoint (set FRONTIER_URL / _API_KEY /
-    _MODEL). Raises BackendError on failure — same contract as ollama()."""
+    _MODEL). Sends `messages` (a full OpenAI-style conversation) when given, else a
+    single user turn. Raises BackendError on failure — same contract as ollama()."""
     body = json.dumps({
         "model": FRONTIER_MODEL,
-        "messages": [{"role": "user", "content": query}],
+        "messages": messages or [{"role": "user", "content": query}],
         "max_tokens": 512,
     }).encode()
     headers = {"content-type": "application/json"}
@@ -175,6 +178,13 @@ def escalate(query):
         return r["choices"][0]["message"]["content"].strip(), time.time() - t0
     except Exception as e:
         raise BackendError("frontier", f"{FRONTIER_MODEL} at {FRONTIER_URL}: {e}")
+
+
+def _escalate(query, messages):
+    """Escalate, passing the conversation only when there is one. The 1-arg call
+    shape is a contract: bench_router/measure_routing/tests replace escalate() with
+    single-argument stubs, and every no-conversation path must keep working there."""
+    return escalate(query, messages=messages) if messages else escalate(query)
 
 
 def _key(ans):
@@ -198,16 +208,19 @@ def local_consistency(query, k=3):
     return (n >= k), best, n, t  # unanimous: escalate unless the model fully agrees with itself
 
 
-def route(query):
-    """Route one query. Never raises for a dead backend — the failure policy (env,
-    read per-call so a live service can be re-tuned) turns a BackendError into either
-    a degraded route or an explicit ERROR result the caller can surface."""
+def route(query, messages=None):
+    """Route one query. `messages` (optional) is the full OpenAI-style conversation:
+    routing decisions and the LOCAL tiers always work on `query` — the last user
+    message — but an escalated call carries the whole conversation to the frontier.
+    Never raises for a dead backend — the failure policy (env, read per-call so a
+    live service can be re-tuned) turns a BackendError into either a degraded route
+    or an explicit ERROR result the caller can surface."""
     try:
-        return _route(query)
+        return _route(query, messages)
     except BackendError as e:
         if e.tier == "local" and os.environ.get("HYBRID_ON_LOCAL_FAIL", "escalate") == "escalate":
             try:
-                ans, dt = escalate(query)
+                ans, dt = _escalate(query, messages)
                 return {"route": "ESCALATE", "why": "local backend down -> frontier",
                         "backend": FRONTIER_MODEL, "answer": ans,
                         "router_s": 0.0, "answer_s": round(dt, 2)}
@@ -226,7 +239,7 @@ def route(query):
                 "router_s": 0.0, "answer_s": 0.0, "error": True}
 
 
-def _route(query):
+def _route(query, messages=None):
     # 0. exact oracle — closed-form arithmetic / conversions / %-change, free + correct.
     exact = solve(query)
     if exact is not None:
@@ -235,7 +248,7 @@ def _route(query):
                 "router_s": 0.0, "answer_s": 0.0}
     # 1. known-hard categories -> escalate by rule.
     if _HARD.search(query) or len(query) > 220:
-        ans, dt = escalate(query)
+        ans, dt = _escalate(query, messages)
         return {"route": "ESCALATE", "why": "rule: hard category", "backend": FRONTIER_MODEL,
                 "answer": ans, "router_s": 0.0, "answer_s": round(dt, 2)}
     # 2. open-ended / creative -> keep local.
@@ -256,7 +269,7 @@ def _route(query):
         raw, dt = ollama(SETUP_PROMPT.format(q=query), num_predict=220, temperature=0.0)
         st, info = equations.verdict(raw)
         if st == "mismatch":
-            esc, et = escalate(query)
+            esc, et = _escalate(query, messages)
             return {"route": "ESCALATE",
                     "why": (f"setup derives {info['var']}="
                             f"{equations.fmt(info['derived'])}≠{_fmt(info['claimed'])}"),
@@ -280,7 +293,7 @@ def _route(query):
             # a variable in the failed expr means it was a CHECK (the answer is inconsistent
             # with a problem constraint); a bare expr means the model's own arithmetic is off.
             kind = "constraint violated" if re.search(r"[a-z]", bad["expr"], re.I) else "local math wrong"
-            esc, et = escalate(query)
+            esc, et = _escalate(query, messages)
             return {"route": "ESCALATE",
                     "why": f"{kind} ({bad['expr']}={_fmt(bad['claimed'])}≠{_fmt(bad['actual'])})",
                     "backend": FRONTIER_MODEL, "answer": esc,
@@ -297,7 +310,7 @@ def _route(query):
     if confident:
         return {"route": "LOCAL", "why": f"self-consistent {agree}/3", "backend": LOCAL_MODEL,
                 "answer": best, "router_s": round(ct, 2), "answer_s": 0.0}
-    ans, dt = escalate(query)
+    ans, dt = _escalate(query, messages)
     return {"route": "ESCALATE", "why": "uncertain (self-inconsistent)", "backend": FRONTIER_MODEL,
             "answer": ans, "router_s": round(ct, 2), "answer_s": round(dt, 2)}
 
