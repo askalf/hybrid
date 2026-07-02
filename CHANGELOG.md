@@ -3,6 +3,22 @@
 All notable changes to hybrid are documented here. This project adheres to
 [Semantic Versioning](https://semver.org).
 
+## v1.1.1 — 2026-07-02
+
+Conservatism fix in the conversion oracle, found by adversarial stress testing against
+the live router.
+
+- **Mixed-unit quantities now decline.** "Convert 5 feet 4 inches to centimeters" was
+  answered `10.16` by the SOLVED tier — the conversion pattern matched the `4 inches`
+  pair and silently dropped the `5 feet`. A wrong answer served with *correct by
+  construction* confidence is the exact failure the deterministic tier exists to prevent.
+  Any query with more than one number-carrying known unit now returns None and falls
+  through — where, live, the derive tier picks it up: the model transcribes
+  `5*30.48 + 4*2.54` and the system re-derives **162.56** exactly. The layered design
+  turned a wrong answer into a verified correct one.
+- `test_solver.py` 50/50 → **53/53** with the mixed-unit regressions pinned
+  (`_CONV1` had the same flaw; both patterns are behind the guard).
+
 ## v1.1.0 — 2026-07-02
 
 The setup re-derivation tier — v1.0.0's documented open problem, moved.
