@@ -6,8 +6,10 @@ The oracle modules have their own suites; this one pins the plumbing that connec
 them, which otherwise only gets exercised with a live model. Both backends are faked
 (scripted answers, call logs), so the whole routing surface tests offline:
 
-  1. TIER ORDER   — solve short-circuits everything; hard/open rules fire before the
-                    oracle tiers; derive runs before plug-back; vote is last.
+  1. TIER ORDER   — solve and the template transcriber short-circuit everything
+                    (templates even out-rank the hard rule — an exact parse beats a
+                    stray keyword); hard/open rules fire before the model-oracle
+                    tiers; derive runs before plug-back; vote is last.
   2. GATING       — the quantitative gate sends digit-and-number-word queries through
                     the oracle tiers and spares factual queries the extra local calls.
   3. VERDICT->ROUTE — mismatch/false-check escalate; derived/checked serve locally
@@ -82,6 +84,10 @@ def run(query, fm, ff, env=None):
 
 BAT = ("A bat and a ball cost $1.10 total. The bat costs $1.00 more than the ball. "
        "How much is the ball?")
+# same problem, phrased OFF the template's rigid shape ("together total" != "cost") —
+# it falls through the transcriber and exercises the model-derive tier
+BAT_ODD = ("A bat and a ball together total $1.10. The bat costs $1.00 more than "
+           "the ball. How much is the ball?")
 BAT_EQNS = "EQN: bat + ball = 1.10\nEQN: bat = ball + 1.00\nANSWER: ball = "
 CHICKEN = ("If a chicken and a half lays an egg and a half in a day and a half, "
            "how many eggs does one chicken lay in one day?")
@@ -94,6 +100,26 @@ def main():
     check("solve short-circuits (no model touched)",
           r["route"] == "SOLVED" and r["answer"] == "893"
           and fm.kinds == [] and ff.calls == 0, str(r["answer"]))
+
+    fm, ff = FakeModel(), FakeFrontier()
+    r = run(BAT, fm, ff)
+    check("template answers the shaped word problem, no model",
+          r["route"] == "SOLVED" and r["answer"] == "0.05"
+          and r["why"] == "template: sum-diff" and fm.kinds == [] and ff.calls == 0,
+          str(r["answer"]))
+
+    fm, ff = FakeModel(), FakeFrontier()
+    r = run("Each fuel tank holds 13.9 liters. How many liters do 73 tanks hold?", fm, ff)
+    check("template out-ranks the hard rule ('liters' keyword)",
+          r["route"] == "SOLVED" and r["answer"] == "1014.7" and ff.calls == 0,
+          r["why"])
+
+    fm, ff = FakeModel(), FakeFrontier()
+    r = run("Emma has 5 brothers. Each brother has 3 sisters. "
+            "How many sisters does Emma have?", fm, ff)
+    check("template declines set-logic -> falls through to oracle tiers",
+          r["route"] == "LOCAL" and fm.kinds and fm.kinds[0] == "setup",
+          ",".join(fm.kinds))
 
     fm, ff = FakeModel(), FakeFrontier()
     r = run("Prove that the square root of 2 is irrational.", fm, ff)
@@ -119,27 +145,28 @@ def main():
 
     # --- 3. verdict -> route ---------------------------------------------------
     fm, ff = FakeModel(setup=BAT_EQNS + "0.10"), FakeFrontier("It is $0.05.")
-    r = run(BAT, fm, ff)
+    r = run(BAT_ODD, fm, ff)
     check("derive mismatch -> hard escalate",
           r["route"] == "ESCALATE" and r["why"].startswith("setup derives")
           and ff.calls == 1, r["why"])
 
     fm, ff = FakeModel(setup=BAT_EQNS + "0.05"), FakeFrontier()
-    r = run(BAT, fm, ff)
+    r = run(BAT_ODD, fm, ff)
     check("derive match serves the exact derived value",
           r["route"] == "LOCAL" and r["answer"] == "0.05" and ff.calls == 0, r["why"])
 
-    fm, ff = (FakeModel(verify="The total is 961.7. CALC: 23.7 * 41 = 961.7"),
-              FakeFrontier("971.7"))
-    r = run("Each crate weighs 23.7 kg. What do 41 crates weigh?", fm, ff)
+    fm, ff = (FakeModel(verify="The total is 966.5. CALC: 23.7 * 41 - 10 = 966.5"),
+              FakeFrontier("961.7"))
+    r = run("Each crate weighs 23.7 kg. What do 41 crates weigh after removing 10 kg "
+            "of packaging?", fm, ff)
     check("false stated arithmetic -> hard escalate",
           r["route"] == "ESCALATE" and "local math wrong" in r["why"] and ff.calls == 1,
           r["why"])
 
     fm, ff = (FakeModel(verify="ANSWER: $87.50\nCHECK: 7 * 12.50 = 87.50"),
               FakeFrontier())
-    r = run("A store sells notebooks at $12.50 each. How much do 7 notebooks cost?",
-            fm, ff)
+    r = run("A store sells notebooks at $12.50 each and pens at $2.00 each. "
+            "How much do 7 notebooks cost?", fm, ff)
     check("checks-hold serves locally",
           r["route"] == "LOCAL" and "87.5" in r["answer"] and ff.calls == 0, r["why"])
 

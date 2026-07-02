@@ -1,7 +1,7 @@
-# Packaging for the hybrid router. Deliberately flat: the repo IS five small readable
+# Packaging for the hybrid router. Deliberately flat: the repo IS six small readable
 # modules, and they install exactly as they read. The distribution name is
-# `hybrid-router`; the import names stay `hybrid` / `solver` / `verify` / `equations` /
-# `server`.
+# `hybrid-router`; the import names stay `hybrid` / `solver` / `templates` / `verify` /
+# `equations` / `server`.
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
@@ -34,7 +34,7 @@ hybrid = "hybrid:main"
 hybrid-server = "server:main"
 
 [tool.setuptools]
-py-modules = ["hybrid", "solver", "verify", "equations", "server"]
+py-modules = ["hybrid", "solver", "templates", "verify", "equations", "server"]
 
 [tool.setuptools.dynamic]
 version = {attr = "hybrid.__version__"}
