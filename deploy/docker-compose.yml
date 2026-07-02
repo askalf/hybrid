@@ -1,0 +1,28 @@
+# The whole local tier in two containers: ollama (the model) + hybrid (the router).
+#
+#   docker compose up -d
+#   docker compose exec ollama ollama pull qwen2.5:7b     # once — the measured default
+#   curl localhost:8080/v1/chat/completions -d '{"messages":[{"role":"user","content":"capital of France?"}]}'
+#
+# Escalation needs FRONTIER_API_KEY in the environment (or a .env next to this file);
+# without it, hard queries return an honest 502 and everything else still works.
+services:
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama:/root/.ollama
+
+  hybrid:
+    build: ..
+    environment:
+      OLLAMA_URL: http://ollama:11434/api/generate
+      FRONTIER_URL: ${FRONTIER_URL:-https://api.openai.com/v1/chat/completions}
+      FRONTIER_API_KEY: ${FRONTIER_API_KEY:-}
+      FRONTIER_MODEL: ${FRONTIER_MODEL:-gpt-4o}
+    ports:
+      - "127.0.0.1:8080:8080"   # loopback only — widen deliberately, with HYBRID_API_KEY
+    depends_on:
+      - ollama
+
+volumes:
+  ollama: {}

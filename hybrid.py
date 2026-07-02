@@ -48,7 +48,7 @@ from solver import solve
 import equations
 import verify
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # Windows cp1252 chokes on non-ASCII
@@ -362,11 +362,19 @@ def demo():
     print(f"ON-BOX:    {on_box}/{n} ({100*on_box//n}%)  answered with no frontier call")
 
 
-if __name__ == "__main__":
+def main():
+    """Console entry point (installed as `hybrid`)."""
+    if len(sys.argv) > 1 and sys.argv[1] in ("--version", "-V"):
+        print(f"hybrid {__version__}")
+        return
     if len(sys.argv) > 1 and sys.argv[1] == "--demo":
         demo()
-    else:
-        q = " ".join(sys.argv[1:]) or sys.stdin.read().strip()
-        r = route(q)
-        print(f"[{r['route']}: {r['why']} -> {r['backend']}  ({r['router_s']+r['answer_s']:.1f}s)]")
-        print(r["answer"])
+        return
+    q = " ".join(sys.argv[1:]) or sys.stdin.read().strip()
+    r = route(q)
+    print(f"[{r['route']}: {r['why']} -> {r['backend']}  ({r['router_s']+r['answer_s']:.1f}s)]")
+    print(r["answer"])
+
+
+if __name__ == "__main__":
+    main()

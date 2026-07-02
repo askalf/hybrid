@@ -184,8 +184,13 @@ class H(BaseHTTPRequestHandler):
         pass                     # the decision log IS the access log
 
 
-if __name__ == "__main__":
+def main():
+    """Console entry point (installed as `hybrid-server`)."""
     print(f"hybrid v{hybrid.__version__} -> http://{HOST}:{PORT}/v1  (model 'hybrid', "
           f"stream ok)   health: /health   decision log: "
           f"{os.environ.get('HYBRID_LOG', 'stdout')}", file=sys.stderr)
     ThreadingHTTPServer((HOST, PORT), H).serve_forever()
+
+
+if __name__ == "__main__":
+    main()

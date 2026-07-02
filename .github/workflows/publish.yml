@@ -1,0 +1,40 @@
+# Publish hybrid-router to PyPI on every GitHub release, via Trusted Publishing
+# (OIDC — no API token anywhere).
+#
+# One-time setup (account owner, web UI only):
+#   pypi.org -> account -> Publishing -> add a "pending" publisher:
+#     PyPI project name: hybrid-router
+#     Owner: askalf     Repository: hybrid
+#     Workflow name: publish.yml
+#     Environment name: pypi
+# The first release after that creates the project; the pending publisher becomes a
+# normal one automatically. Until then, this workflow fails on releases — harmless.
+name: publish
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write        # the OIDC exchange IS the credential
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: build sdist + wheel
+        run: |
+          python -m pip install build
+          python -m build
+      - name: sanity — tag matches the packaged version
+        run: |
+          pkg=$(python -c "import hybrid; print(hybrid.__version__)")
+          test "v$pkg" = "${GITHUB_REF_NAME}" || { echo "tag ${GITHUB_REF_NAME} != hybrid.__version__ $pkg"; exit 1; }
+      - uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1

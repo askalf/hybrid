@@ -1,0 +1,12 @@
+.git
+.github
+__pycache__
+*.pyc
+dist
+build
+*.egg-info
+og.png
+deploy
+test_*.py
+bench_*.py
+measure_routing.py
