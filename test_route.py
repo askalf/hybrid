@@ -45,11 +45,13 @@ class FakeModel:
         self.concise = list(concise or [])
         self.fail = fail
         self.kinds = []
+        self.models = []
 
-    def __call__(self, prompt, num_predict=256, temperature=0.0):
+    def __call__(self, prompt, num_predict=256, temperature=0.0, model=None):
         kind = ("setup" if "EQN:" in prompt else
                 "verify" if "CHECK:" in prompt else "concise")
         self.kinds.append(kind)
+        self.models.append(model)
         if self.fail:
             raise hybrid.BackendError("local", "connection refused (fake)")
         if kind == "setup":
@@ -175,6 +177,24 @@ def main():
     check("unanimous vote stays local",
           r["route"] == "LOCAL" and "self-consistent" in r["why"] and ff.calls == 0,
           r["why"])
+
+    # --- 3.5 split model: fast model on the vote tier, never on transcription ---
+    saved_fast = hybrid.LOCAL_MODEL_FAST
+    hybrid.LOCAL_MODEL_FAST = "tiny-fake"
+    try:
+        fm, ff = FakeModel(concise=["Tokyo", "Tokyo", "Tokyo"]), FakeFrontier()
+        r = run("What is the capital of Japan?", fm, ff)
+        check("vote tier uses LOCAL_MODEL_FAST",
+              r["route"] == "LOCAL" and fm.models == ["tiny-fake"] * 3
+              and r["backend"] == "tiny-fake", ",".join(map(str, fm.models)))
+
+        fm, ff = FakeModel(concise=["2/3", "2/3", "2/3"]), FakeFrontier()
+        run(CHICKEN, fm, ff)
+        check("transcription tiers stay on LOCAL_MODEL (never the fast model)",
+              fm.kinds[:2] == ["setup", "verify"] and fm.models[0] is None
+              and fm.models[1] is None, ",".join(map(str, fm.models[:2])))
+    finally:
+        hybrid.LOCAL_MODEL_FAST = saved_fast
 
     fm, ff = FakeModel(concise=["42", "41", "40"]), FakeFrontier("The answer is 42.")
     r = run("What is the answer to everything?", fm, ff)

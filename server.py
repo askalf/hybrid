@@ -34,8 +34,15 @@ service can be re-tuned without a restart):
   HYBRID_MAX_BODY     per-request. Request-body cap in bytes, default 1048576.
   HYBRID_LOG          per-request. Decision-log JSONL file (append); default stdout.
   HYBRID_LOG_QUERIES  per-request. "1" includes query text in the log (default off).
+  HYBRID_CACHE_TTL    per-request. Seconds to serve a repeated single-turn query from
+                      memory instead of re-routing it (default 0 = off). Real traffic
+                      repeats; a hit answers in ~0 ms with x_hybrid.cached = true.
+                      Multi-turn requests, ERROR results, and DEGRADED answers are
+                      never cached.
+  HYBRID_CACHE_MAX    per-request. Cache entry cap, LRU-evicted (default 512).
 """
-import hashlib, hmac, json, os, sys, time
+import hashlib, hmac, json, os, sys, threading, time
+from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import hybrid
 
@@ -55,6 +62,38 @@ def _log_decision(rec):
             f.write(line + "\n")
     else:
         print(line, flush=True)
+
+
+# --- answer cache (opt-in via HYBRID_CACHE_TTL) --------------------------------
+# Single-turn only: with a conversation in play the same last message can mean a
+# different thing, so multi-turn requests always re-route.
+_CACHE = OrderedDict()               # sha256(query) -> (expiry, routed result)
+_CACHE_LOCK = threading.Lock()
+
+
+def _cache_get(key):
+    with _CACHE_LOCK:
+        hit = _CACHE.get(key)
+        if not hit:
+            return None
+        expiry, r = hit
+        if time.time() > expiry:
+            del _CACHE[key]
+            return None
+        _CACHE.move_to_end(key)
+        return dict(r)
+
+
+def _cache_put(key, r, ttl):
+    try:
+        cap = int(os.environ.get("HYBRID_CACHE_MAX", "512"))
+    except ValueError:
+        cap = 512
+    with _CACHE_LOCK:
+        _CACHE[key] = (time.time() + ttl, dict(r))
+        _CACHE.move_to_end(key)
+        while len(_CACHE) > max(1, cap):
+            _CACHE.popitem(last=False)
 
 
 class H(BaseHTTPRequestHandler):
@@ -124,17 +163,33 @@ class H(BaseHTTPRequestHandler):
                                               "type": "invalid_request_error"}})
 
         t0 = time.time()
-        r = hybrid.route(query, messages=messages if len(messages) > 1 else None)
+        try:
+            ttl = float(os.environ.get("HYBRID_CACHE_TTL", "0"))
+        except ValueError:
+            ttl = 0.0
+        single_turn = len(messages) <= 1
+        key = hashlib.sha256(query.encode()).hexdigest()
+        r = _cache_get(key) if (ttl > 0 and single_turn) else None
+        cached = r is not None
+        if not cached:
+            r = hybrid.route(query, messages=messages if len(messages) > 1 else None)
+            if (ttl > 0 and single_turn and r["route"] in ("SOLVED", "LOCAL", "ESCALATE")
+                    and "DEGRADED" not in r["why"]):
+                _cache_put(key, r, ttl)
         xh = {"route": r["route"], "why": r["why"], "backend": r["backend"],
-              "latency_s": round(r["router_s"] + r["answer_s"], 2),
+              "latency_s": 0.0 if cached else round(r["router_s"] + r["answer_s"], 2),
               "usage_estimated": True}
+        if cached:
+            xh["cached"] = True
         status = 502 if r["route"] == "ERROR" else 200
         rec = {"ts": round(time.time(), 3), "route": r["route"], "why": r["why"],
                "backend": r["backend"], "latency_s": xh["latency_s"],
                "wall_s": round(time.time() - t0, 2), "status": status,
                "stream": bool(req.get("stream")),
-               "q_sha": hashlib.sha256(query.encode()).hexdigest()[:12],
+               "q_sha": key[:12],
                "q_chars": len(query)}
+        if cached:
+            rec["cached"] = True
         if os.environ.get("HYBRID_LOG_QUERIES") == "1":
             rec["query"] = query
         _log_decision(rec)
