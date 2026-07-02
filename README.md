@@ -138,17 +138,37 @@ python test_solver.py                          # solver tests (53/53, no model n
 python test_verify.py                          # verifier tests (28/28, no model needed)
 python test_equations.py                       # setup re-derivation tests (45/45, no model needed)
 python test_route.py                           # router plumbing + failure policy (16/16, no model needed)
+python test_server.py                          # server surface: SSE, auth, limits (18/18, no model needed)
 python bench_router.py                         # full-router benchmark: on-box %, safety, catches
 python measure_routing.py                      # router economics: $ saved vs all-frontier (needs FRONTIER_API_KEY)
 python hybrid.py "your question"               # route one query
 python hybrid.py --demo                        # mixed test set + summary
-python server.py                               # OpenAI-compatible server on :8080 (model "hybrid")
+python server.py                               # OpenAI-compatible server on :8080 (model "hybrid", stream ok)
 ```
 
-The solver, verifier, and setup re-derivation tiers (and their tests) need **nothing** —
-no model, no network — so they run and test anywhere. The server returns an `x_hybrid` field (route / why /
-backend / latency), so any OpenAI client (Cursor, Cline, scripts) gets local-first +
-escalation transparently and can see which tier answered.
+The oracle tiers and both harnesses (router + server tests) need **nothing** — no model,
+no network — so all 160 tests run anywhere, including CI.
+
+### The server, as a service
+
+`server.py` speaks enough OpenAI protocol for real clients: **`stream: true` works**
+(SSE — role delta, one content delta, a stop chunk, `[DONE]`; the content arrives whole
+because routing has to finish before an answer exists), multi-turn conversations route
+on the last user message while an **escalated call carries the whole conversation**, and
+every response has `x_hybrid` (route / why / backend / latency) plus a chars/4 `usage`
+estimate (flagged `usage_estimated` — the local tier isn't token-metered).
+
+Every request writes one **JSONL decision line** — route, why, backend, latency, status,
+a sha256 prefix of the query — to stdout (the banner goes to stderr) or to `HYBRID_LOG`.
+Query text stays out of the log unless `HYBRID_LOG_QUERIES=1`. A backend failure is a
+**502 with an OpenAI-shaped error object** (see failure policy), never error text
+disguised as an answer. `/health` reports liveness + version without auth; set
+`HYBRID_API_KEY` to require a bearer token on everything else, and `HYBRID_HOST` if you
+deliberately bind beyond loopback.
+
+Capacity honesty: on a CPU box the local tier runs **seconds-to-a-minute per query** and
+effectively serially — that's memory bandwidth, not a bug. Size expectations (and any
+reverse proxy timeouts) accordingly.
 
 ### Config (env)
 
@@ -162,6 +182,11 @@ escalation transparently and can see which tier answered.
 | `PORT` | `8080` | server.py listen port |
 | `HYBRID_ON_LOCAL_FAIL` | `escalate` | local backend down → `escalate` to the frontier, or `error` |
 | `HYBRID_ON_FRONTIER_FAIL` | `error` | frontier down → honest `error`, or `local` (degraded, unverified) |
+| `HYBRID_HOST` | `127.0.0.1` | server bind address — set with intent, pair with auth |
+| `HYBRID_API_KEY` | — | if set, server requires `Authorization: Bearer <key>` (except `/health`) |
+| `HYBRID_MAX_BODY` | `1048576` | server request-body cap, bytes |
+| `HYBRID_LOG` | stdout | decision-log JSONL file (append) |
+| `HYBRID_LOG_QUERIES` | off | `1` = include query text in the decision log |
 
 `FRONTIER_URL` is just an OpenAI-compatible chat endpoint — OpenAI, a local proxy, or your
 own gateway. The key only ever leaves your machine on an *escalated* query.
@@ -216,12 +241,14 @@ the line keeps moving; it doesn't disappear.
 - `equations.py` — setup re-derivation: solve the model's transcribed equation system exactly
   (linear systems, Gaussian elimination over `Fraction`s); conservative
 - `verify.py` — verify-the-local-answer: re-derive the model's plugged-in checks exactly
-- `test_solver.py` / `test_verify.py` / `test_equations.py` / `test_route.py` — 142 tests
-  (oracles + router plumbing + failure policy); all offline, no model needed
+- `test_solver.py` / `test_verify.py` / `test_equations.py` / `test_route.py` /
+  `test_server.py` — 160 tests (oracles + router plumbing + failure policy + server
+  surface); all offline, no model needed
 - `bench_offline.py` — what the solver buys versus a no-solver router (no model needed)
 - `bench_router.py` — full-router benchmark: on-box rate, on-box safety, catches (frontier stubbed)
 - `measure_routing.py` — router economics: prices every query's frontier cost to show real $ saved
-- `server.py` — OpenAI-compatible front end
+- `server.py` — OpenAI-compatible front end: SSE streaming, JSONL decision log, body
+  caps, optional bearer auth
 
 ## License
 
