@@ -1,0 +1,40 @@
+# Packaging for the hybrid router. Deliberately flat: the repo IS five small readable
+# modules, and they install exactly as they read. The distribution name is
+# `hybrid-router`; the import names stay `hybrid` / `solver` / `verify` / `equations` /
+# `server`.
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hybrid-router"
+description = "Local-first LLM router with a deterministic verifier — answer the easy majority on your own hardware, escalate only what earns the frontier."
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dynamic = ["version"]
+authors = [{name = "Thomas Sprayberry"}]
+keywords = ["llm", "router", "local-first", "ollama", "openai-compatible", "verifier", "own-your-stack"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://github.com/askalf/hybrid"
+Changelog = "https://github.com/askalf/hybrid/blob/main/CHANGELOG.md"
+Writeup = "https://sprayberrylabs.com/blog/own-your-inference"
+
+[project.scripts]
+hybrid = "hybrid:main"
+hybrid-server = "server:main"
+
+[tool.setuptools]
+py-modules = ["hybrid", "solver", "verify", "equations", "server"]
+
+[tool.setuptools.dynamic]
+version = {attr = "hybrid.__version__"}

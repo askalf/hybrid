@@ -3,6 +3,37 @@
 All notable changes to hybrid are documented here. This project adheres to
 [Semantic Versioning](https://semver.org).
 
+## v1.4.0 — 2026-07-02
+
+Production hardening, part 3: installable, deployable, publishable.
+
+### Packaging
+
+- **`pip install hybrid-router`** (or `pipx install hybrid-router`) — console commands
+  **`hybrid`** and **`hybrid-server`**. Zero runtime dependencies: the wheel is the five
+  flat modules, installed exactly as they read in the repo. Version single-sourced from
+  `hybrid.__version__`; `hybrid --version` reports it.
+- **PyPI Trusted Publishing** (`publish.yml`) — every GitHub release builds and publishes
+  via OIDC; no API tokens anywhere. A sanity step refuses to publish when the tag doesn't
+  match `hybrid.__version__`. First publish uses PyPI's *pending publisher* flow (a
+  one-time web-UI registration; verified against the current PyPI docs).
+
+### Deploy
+
+- **`Dockerfile`** — python:3.12-slim + the five modules (~50 MB), `/health` healthcheck,
+  stdout = the JSONL decision log.
+- **`deploy/docker-compose.yml`** — the whole local tier in two containers (ollama +
+  hybrid), port published to loopback only; escalation works the moment
+  `FRONTIER_API_KEY` lands in the environment.
+- **`deploy/hybrid.service`** — hardened systemd unit (`DynamicUser`,
+  `ProtectSystem=strict`, `NoNewPrivileges`); `journalctl -u hybrid` is the decision log.
+
+### CI
+
+- New **package job**: build sdist + wheel, install the wheel, then smoke the installed
+  console scripts *away from the checkout* — `hybrid --version`, a SOLVED query with no
+  model, and a `hybrid-server` boot + `/health` probe.
+
 ## v1.3.0 — 2026-07-02
 
 Production hardening, part 2: the server grows the surface a real OpenAI client

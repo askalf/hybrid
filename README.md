@@ -3,7 +3,7 @@
 [![tests](https://github.com/askalf/hybrid/actions/workflows/test.yml/badge.svg)](https://github.com/askalf/hybrid/actions/workflows/test.yml)
 
 <p align="center">
-  <img src="og.png" alt="hybrid: answer the easy majority locally, escalate the few that earn it" width="840">
+  <img src="https://raw.githubusercontent.com/askalf/hybrid/main/og.png" alt="hybrid: answer the easy majority locally, escalate the few that earn it" width="840">
 </p>
 
 > _hybrid — **own your inference**. Part of **[Own Your Stack](https://github.com/askalf)** — own your AI infrastructure instead of renting it by the token._
@@ -121,6 +121,18 @@ correctly sends the few token-expensive hard problems to the frontier — which 
 point, and the reason query-share overstates the savings. Measured against claude-sonnet-4-6
 list pricing ($3 / $15 per 1M); set `PRICE_IN_PER_M` / `PRICE_OUT_PER_M` for your own frontier.
 
+## Install
+
+```bash
+pipx install hybrid-router       # console commands: hybrid, hybrid-server
+# or: pip install hybrid-router
+# or straight from the repo: pipx install git+https://github.com/askalf/hybrid
+```
+
+Zero runtime dependencies — the wheel is the five modules you can read above, installed
+exactly as they read. Published to PyPI from CI on every release via **Trusted
+Publishing** (OIDC — no tokens anywhere). `hybrid --version` tells you what you got.
+
 ## Run
 
 ```bash
@@ -169,6 +181,12 @@ deliberately bind beyond loopback.
 Capacity honesty: on a CPU box the local tier runs **seconds-to-a-minute per query** and
 effectively serially — that's memory bandwidth, not a bug. Size expectations (and any
 reverse proxy timeouts) accordingly.
+
+Deploying it: the **`Dockerfile`** is python-slim plus the five modules (with a
+`/health` healthcheck); **`deploy/docker-compose.yml`** runs the whole local tier —
+ollama + hybrid — with the port published to loopback only; **`deploy/hybrid.service`**
+is a hardened systemd unit (`DynamicUser`, `ProtectSystem=strict`) where
+`journalctl -u hybrid` *is* the decision log.
 
 ### Config (env)
 
@@ -249,6 +267,8 @@ the line keeps moving; it doesn't disappear.
 - `measure_routing.py` — router economics: prices every query's frontier cost to show real $ saved
 - `server.py` — OpenAI-compatible front end: SSE streaming, JSONL decision log, body
   caps, optional bearer auth
+- `pyproject.toml` / `Dockerfile` / `deploy/` — pip/pipx packaging (console commands
+  `hybrid` + `hybrid-server`), container image, compose + systemd examples
 
 ## License
 

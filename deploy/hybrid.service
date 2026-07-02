@@ -1,0 +1,25 @@
+# systemd unit for the hybrid server.
+#   pipx install hybrid-router   (or: pip install hybrid-router)
+#   cp deploy/hybrid.service /etc/systemd/system/ && systemctl enable --now hybrid
+# stdout is the JSONL decision log -> journalctl -u hybrid is your routing history.
+[Unit]
+Description=hybrid — local-first LLM router (OpenAI-compatible)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/hybrid-server
+Environment=PORT=8080
+# Secrets and tuning live in a root-owned env file, not the unit:
+#   FRONTIER_API_KEY=..., HYBRID_API_KEY=..., HYBRID_ON_LOCAL_FAIL=...
+EnvironmentFile=-/etc/hybrid.env
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
