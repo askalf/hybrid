@@ -53,12 +53,13 @@ Failure policy (env) — a dead backend degrades predictably instead of crashing
 """
 import sys, os, time, json, re, urllib.request
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from solver import solve
 import equations
 import templates
 import verify
 
-__version__ = "1.6.0"
+__version__ = "1.6.1"
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # Windows cp1252 chokes on non-ASCII
@@ -213,12 +214,19 @@ def _key(ans):
 
 
 def local_consistency(query, k=3):
-    """Sample the fast local model k times; 'confident' iff all answers agree."""
-    samples, t = [], 0.0
-    for _ in range(k):
-        a, dt = ollama(CONCISE.format(q=query), num_predict=80, temperature=0.6,
-                       model=LOCAL_MODEL_FAST)
-        samples.append(a); t += dt
+    """Sample the fast local model k times CONCURRENTLY; 'confident' iff all answers
+    agree. Concurrency is a pure wall-time win: CPU decode is memory-bandwidth-bound,
+    so a server that batches (Ollama with OLLAMA_NUM_PARALLEL >= k) streams the weights
+    once per token-step for all k samples — the vote costs roughly ONE sample's wall
+    time instead of k. Against a serial server the requests just queue: same behavior,
+    same total time as the old loop. A BackendError in any sample re-raises here, so
+    the failure policy sees exactly what it saw before."""
+    t0 = time.time()
+    with ThreadPoolExecutor(max_workers=k) as ex:
+        futures = [ex.submit(ollama, CONCISE.format(q=query), 80, 0.6, LOCAL_MODEL_FAST)
+                   for _ in range(k)]
+        samples = [f.result()[0] for f in futures]
+    t = time.time() - t0
     keys = [_key(s) for s in samples]
     top, n = Counter(keys).most_common(1)[0]
     best = next(s for s, kk in zip(samples, keys) if kk == top)
