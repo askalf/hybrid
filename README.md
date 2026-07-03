@@ -160,8 +160,11 @@ Publishing** (OIDC — no tokens anywhere). `hybrid --version` tells you what yo
 
 ```bash
 # local tier — Ollama with a small model
-ollama pull qwen2.5:7b           # the measured default; qwen2.5:3b is faster but follows
-                                 # the verify-CHECK format less reliably
+ollama pull qwen2.5:7b           # the measured default — the TRANSCRIPTION model
+ollama pull llama3.2:3b          # optional: LOCAL_MODEL_FAST=llama3.2:3b makes the
+                                 # vote/creative tiers ~2x faster. Measured live: a 3B is
+                                 # safe there — but NEVER as LOCAL_MODEL; allowed to
+                                 # transcribe, it tripled wrong-served answers
 
 # frontier tier — any OpenAI-compatible endpoint
 export FRONTIER_API_KEY=sk-...                                    # OpenAI, or your own proxy
@@ -175,8 +178,8 @@ python test_solver.py                          # solver tests (53/53, no model n
 python test_templates.py                       # template transcriber tests (58/58, no model needed)
 python test_verify.py                          # verifier tests (28/28, no model needed)
 python test_equations.py                       # setup re-derivation tests (45/45, no model needed)
-python test_route.py                           # router plumbing + failure policy (19/19, no model needed)
-python test_server.py                          # server surface: SSE, auth, limits (18/18, no model needed)
+python test_route.py                           # router plumbing + failure policy (21/21, no model needed)
+python test_server.py                          # server surface: SSE, auth, limits, cache (22/22, no model needed)
 python bench_router.py                         # full-router benchmark: on-box %, safety, catches
 python measure_routing.py                      # router economics: $ saved vs all-frontier (needs FRONTIER_API_KEY)
 python hybrid.py "your question"               # route one query
@@ -185,7 +188,7 @@ python server.py                               # OpenAI-compatible server on :80
 ```
 
 The oracle tiers and both harnesses (router + server tests) need **nothing** — no model,
-no network — so all 221 tests run anywhere, including CI.
+no network — so all 227 tests run anywhere, including CI.
 
 ### The server, as a service
 
@@ -204,9 +207,16 @@ disguised as an answer. `/health` reports liveness + version without auth; set
 `HYBRID_API_KEY` to require a bearer token on everything else, and `HYBRID_HOST` if you
 deliberately bind beyond loopback.
 
-Capacity honesty: on a CPU box the local tier runs **seconds-to-a-minute per query** and
-effectively serially — that's memory bandwidth, not a bug. Size expectations (and any
-reverse proxy timeouts) accordingly.
+**Repeats are free.** Set `HYBRID_CACHE_TTL=300` and a repeated single-turn query is
+served from memory in ~0 ms with `x_hybrid.cached: true` — real traffic repeats, and a
+cache hit costs neither tokens nor bandwidth. Multi-turn requests, `ERROR` results, and
+`DEGRADED` answers are never cached; `HYBRID_CACHE_MAX` (default 512) caps entries, LRU.
+
+Capacity honesty: on a CPU box the *model* tiers run **seconds-to-a-minute per query**
+and effectively serially — that's memory bandwidth, not a bug. The solver and template
+tiers answer in ~0 ms regardless, and `LOCAL_MODEL_FAST` roughly halves the vote/creative
+tiers. Size expectations (and any reverse proxy timeouts) for the residual model-path
+queries accordingly.
 
 Deploying it: the **`Dockerfile`** is python-slim plus the five modules (with a
 `/health` healthcheck); **`deploy/docker-compose.yml`** runs the whole local tier —
@@ -219,7 +229,8 @@ is a hardened systemd unit (`DynamicUser`, `ProtectSystem=strict`) where
 | var | default | |
 |---|---|---|
 | `OLLAMA_URL` | `http://127.0.0.1:11434/api/generate` | local Ollama endpoint |
-| `LOCAL_MODEL` | `qwen2.5:7b` | local model tag |
+| `LOCAL_MODEL` | `qwen2.5:7b` | the **transcription** model (derive/verify tiers) |
+| `LOCAL_MODEL_FAST` | = `LOCAL_MODEL` | smaller model for the **vote/creative** tiers only — safe there, measured; never for transcription |
 | `FRONTIER_URL` | `https://api.openai.com/v1/chat/completions` | any OpenAI-compatible endpoint |
 | `FRONTIER_API_KEY` | — | required for escalation |
 | `FRONTIER_MODEL` | `gpt-4o` | frontier model id |
@@ -231,6 +242,8 @@ is a hardened systemd unit (`DynamicUser`, `ProtectSystem=strict`) where
 | `HYBRID_MAX_BODY` | `1048576` | server request-body cap, bytes |
 | `HYBRID_LOG` | stdout | decision-log JSONL file (append) |
 | `HYBRID_LOG_QUERIES` | off | `1` = include query text in the decision log |
+| `HYBRID_CACHE_TTL` | `0` (off) | seconds to serve repeated single-turn queries from memory (~0 ms hits) |
+| `HYBRID_CACHE_MAX` | `512` | answer-cache entry cap, LRU-evicted |
 
 `FRONTIER_URL` is just an OpenAI-compatible chat endpoint — OpenAI, a local proxy, or your
 own gateway. The key only ever leaves your machine on an *escalated* query.
@@ -288,8 +301,8 @@ the line keeps moving; it doesn't disappear.
   (linear systems, Gaussian elimination over `Fraction`s); conservative
 - `verify.py` — verify-the-local-answer: re-derive the model's plugged-in checks exactly
 - `test_solver.py` / `test_templates.py` / `test_verify.py` / `test_equations.py` /
-  `test_route.py` / `test_server.py` — 221 tests (oracles + transcriber + router
-  plumbing + failure policy + server surface); all offline, no model needed
+  `test_route.py` / `test_server.py` — 227 tests (oracles + transcriber + router
+  plumbing + failure policy + server surface + cache); all offline, no model needed
 - `bench_offline.py` — what the solver buys versus a no-solver router (no model needed)
 - `bench_router.py` — full-router benchmark: on-box rate, on-box safety, catches (frontier stubbed)
 - `measure_routing.py` — router economics: prices every query's frontier cost to show real $ saved

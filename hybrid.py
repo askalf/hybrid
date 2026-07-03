@@ -29,7 +29,13 @@ Everything the oracle can't settle falls back to self-consistency, then the fron
 
 Config (env):
   OLLAMA_URL        default http://127.0.0.1:11434/api/generate
-  LOCAL_MODEL       default qwen2.5:7b
+  LOCAL_MODEL       default qwen2.5:7b — the TRANSCRIPTION model (derive/verify tiers)
+  LOCAL_MODEL_FAST  default LOCAL_MODEL — a smaller model for the vote/creative tiers
+                    only. Measured live: a 3B is safe (and ~2x faster) on factual votes
+                    and rewrites, but tripled wrong-served answers when allowed to
+                    TRANSCRIBE — it writes wrong-but-consistent equation systems the
+                    exact oracle then faithfully re-derives. Transcription stays on
+                    LOCAL_MODEL; never point LOCAL_MODEL_FAST at the derive/verify path.
   FRONTIER_URL      default https://api.openai.com/v1/chat/completions  (any OpenAI-compatible endpoint)
   FRONTIER_API_KEY  required for escalation
   FRONTIER_MODEL    default gpt-4o
@@ -52,7 +58,7 @@ import equations
 import templates
 import verify
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # Windows cp1252 chokes on non-ASCII
@@ -61,6 +67,11 @@ except Exception:
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434/api/generate")
 LOCAL_MODEL = os.environ.get("LOCAL_MODEL", "qwen2.5:7b")
+# The vote/creative tiers tolerate a smaller, faster model: their outputs are either
+# voted on or have no single right answer. The transcription tiers do NOT (a weaker
+# model's garbled-but-consistent equations sail through the oracle), so they always
+# use LOCAL_MODEL.
+LOCAL_MODEL_FAST = os.environ.get("LOCAL_MODEL_FAST") or LOCAL_MODEL
 FRONTIER_URL = os.environ.get("FRONTIER_URL", "https://api.openai.com/v1/chat/completions")
 FRONTIER_KEY = os.environ.get("FRONTIER_API_KEY", "")
 FRONTIER_MODEL = os.environ.get("FRONTIER_MODEL", "gpt-4o")
@@ -141,11 +152,12 @@ def _quantitative(q):
     return any(ch.isdigit() for ch in q) or len(_NUMBER_WORD.findall(q)) >= 2
 
 
-def ollama(prompt, num_predict=256, temperature=0.0):
-    """One local-model call. Retries once (transports flake), then raises BackendError —
+def ollama(prompt, num_predict=256, temperature=0.0, model=None):
+    """One local-model call (default LOCAL_MODEL; the vote/creative tiers pass
+    LOCAL_MODEL_FAST). Retries once (transports flake), then raises BackendError —
     an answer string is ALWAYS a real model answer, never an error in disguise."""
     body = json.dumps({
-        "model": LOCAL_MODEL, "prompt": prompt, "stream": False, "keep_alive": "5m",
+        "model": model or LOCAL_MODEL, "prompt": prompt, "stream": False, "keep_alive": "5m",
         "options": {"num_predict": num_predict, "temperature": temperature},
     }).encode()
     t0 = time.time()
@@ -160,7 +172,7 @@ def ollama(prompt, num_predict=256, temperature=0.0):
             last = e
             if attempt == 1:
                 time.sleep(1.0)
-    raise BackendError("local", f"{LOCAL_MODEL} at {OLLAMA_URL}: {last}")
+    raise BackendError("local", f"{model or LOCAL_MODEL} at {OLLAMA_URL}: {last}")
 
 
 def escalate(query, messages=None):
@@ -201,10 +213,11 @@ def _key(ans):
 
 
 def local_consistency(query, k=3):
-    """Sample the local model k times; 'confident' iff all answers agree."""
+    """Sample the fast local model k times; 'confident' iff all answers agree."""
     samples, t = [], 0.0
     for _ in range(k):
-        a, dt = ollama(CONCISE.format(q=query), num_predict=80, temperature=0.6)
+        a, dt = ollama(CONCISE.format(q=query), num_predict=80, temperature=0.6,
+                       model=LOCAL_MODEL_FAST)
         samples.append(a); t += dt
     keys = [_key(s) for s in samples]
     top, n = Counter(keys).most_common(1)[0]
@@ -232,9 +245,10 @@ def route(query, messages=None):
                 e = e2                        # frontier is down too -> ERROR below
         elif e.tier == "frontier" and os.environ.get("HYBRID_ON_FRONTIER_FAIL", "error") == "local":
             try:
-                ans, dt = ollama(CONCISE.format(q=query), num_predict=200)
+                ans, dt = ollama(CONCISE.format(q=query), num_predict=200,
+                                 model=LOCAL_MODEL_FAST)
                 return {"route": "LOCAL", "why": "DEGRADED: frontier down, unverified local",
-                        "backend": LOCAL_MODEL, "answer": ans,
+                        "backend": LOCAL_MODEL_FAST, "answer": ans,
                         "router_s": 0.0, "answer_s": round(dt, 2)}
             except BackendError as e2:
                 e = e2
@@ -265,10 +279,10 @@ def _route(query, messages=None):
         ans, dt = _escalate(query, messages)
         return {"route": "ESCALATE", "why": "rule: hard category", "backend": FRONTIER_MODEL,
                 "answer": ans, "router_s": 0.0, "answer_s": round(dt, 2)}
-    # 2. open-ended / creative -> keep local.
+    # 2. open-ended / creative -> keep local (no single right answer, fast model fine).
     if _OPEN.search(query):
-        ans, dt = ollama(CONCISE.format(q=query), num_predict=200)
-        return {"route": "LOCAL", "why": "open-ended (local ok)", "backend": LOCAL_MODEL,
+        ans, dt = ollama(CONCISE.format(q=query), num_predict=200, model=LOCAL_MODEL_FAST)
+        return {"route": "LOCAL", "why": "open-ended (local ok)", "backend": LOCAL_MODEL_FAST,
                 "answer": ans, "router_s": 0.0, "answer_s": round(dt, 2)}
     # 3. quantitative queries get the exact oracle, strongest signal first:
     #    derive (independent re-derivation) > plug-back (consistency) > vote (agreement).
@@ -322,7 +336,8 @@ def _route(query, messages=None):
     # 4. everything else -> self-consistency decides.
     confident, best, agree, ct = local_consistency(query)
     if confident:
-        return {"route": "LOCAL", "why": f"self-consistent {agree}/3", "backend": LOCAL_MODEL,
+        return {"route": "LOCAL", "why": f"self-consistent {agree}/3",
+                "backend": LOCAL_MODEL_FAST,
                 "answer": best, "router_s": round(ct, 2), "answer_s": 0.0}
     ans, dt = _escalate(query, messages)
     return {"route": "ESCALATE", "why": "uncertain (self-inconsistent)", "backend": FRONTIER_MODEL,
