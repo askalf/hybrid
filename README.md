@@ -84,7 +84,10 @@ query → router ─┬─ solve:    arithmetic · unit conversion · %-change? 
    pure-numeric checks we re-derive exactly. A false check is a **hard escalate** (the answer
    is provably inconsistent with the problem); all-checks-hold stays local. Strictly stronger
    than self-consistency, which at temperature 0 just repeats the same wrong number.
-6. **Self-consistency** for the rest: answer a few times; unanimous → keep local, else escalate.
+6. **Self-consistency** for the rest: answer a few times — concurrently, so a batching
+   server (Ollama with `OLLAMA_NUM_PARALLEL` ≥ 3) streams the weights once for all
+   samples and the vote costs about one sample's wall time; unanimous → keep local,
+   else escalate.
 
 ## Measured (`bench_router.py`, 22-query labeled set, qwen2.5:7b)
 

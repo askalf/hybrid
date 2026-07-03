@@ -3,6 +3,18 @@
 All notable changes to hybrid are documented here. This project adheres to
 [Semantic Versioning](https://semver.org).
 
+## v1.6.1 — 2026-07-03
+
+- **The self-consistency vote fires its k samples concurrently** (stdlib
+  `ThreadPoolExecutor`). CPU decode is memory-bandwidth-bound, so a server that
+  batches concurrent requests — Ollama with `OLLAMA_NUM_PARALLEL >= 3` — streams the
+  weights once per token-step for all samples: the vote costs roughly ONE sample's
+  wall time instead of three. Against a serial server the requests simply queue (same
+  behavior and total time as the old loop), so there is no configuration to get wrong.
+  Verified live on the box after raising `OLLAMA_NUM_PARALLEL` to 4: three concurrent
+  decodes overlap instead of serializing. Errors re-raise exactly as before — the
+  failure-policy surface is unchanged, and the whole 227-test suite passes untouched.
+
 ## v1.6.0 — 2026-07-02
 
 Split local models + an answer cache — the other two latency levers that need no GPU.
