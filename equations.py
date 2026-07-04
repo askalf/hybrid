@@ -245,7 +245,7 @@ def parse_answer(text):
             if not coeffs:
                 return var, float(const), 9, line   # exact -> half-ULP of 9 shown decimals
         except (_NonLinear, SyntaxError, ValueError, ZeroDivisionError, OverflowError):
-            pass
+            pass                            # not a clean exact expression -> last-number path below
     nums = _NUM.findall(rhs) or _NUM.findall(line)
     if not nums:
         return None

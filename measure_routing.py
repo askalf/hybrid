@@ -24,9 +24,9 @@ import hybrid
 from bench_router import CASES
 
 try:
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # Windows cp1252 chokes on non-ASCII
 except Exception:
-    pass
+    pass  # best-effort console tweak; stdout may be replaced/unreconfigurable (tests, pipes)
 
 PRICE_IN = float(os.environ.get("PRICE_IN_PER_M", "3.0")) / 1_000_000
 PRICE_OUT = float(os.environ.get("PRICE_OUT_PER_M", "15.0")) / 1_000_000

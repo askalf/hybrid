@@ -31,7 +31,7 @@ jobs:
           python-version: "3.12"
       - name: build sdist + wheel
         run: |
-          python -m pip install build
+          python -m pip install --require-hashes -r .github/build-requirements.txt
           python -m build
       - name: sanity — tag matches the packaged version
         run: |

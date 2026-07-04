@@ -64,7 +64,7 @@ __version__ = "1.6.1"
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # Windows cp1252 chokes on non-ASCII
 except Exception:
-    pass
+    pass  # best-effort console tweak; stdout may be replaced/unreconfigurable (tests, pipes)
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434/api/generate")
 LOCAL_MODEL = os.environ.get("LOCAL_MODEL", "qwen2.5:7b")

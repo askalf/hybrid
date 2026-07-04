@@ -141,7 +141,7 @@ def main():
           ",".join(fm.kinds))
 
     fm = FakeModel(concise=["2/3", "2/3", "2/3"])   # setup+verify defaults -> nothing usable
-    r = run(CHICKEN, fm, FakeFrontier())
+    run(CHICKEN, fm, FakeFrontier())
     check("number-words (no digits) open the oracle tiers",
           fm.kinds[0] == "setup", ",".join(fm.kinds))
 
