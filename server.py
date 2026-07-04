@@ -126,7 +126,7 @@ class H(BaseHTTPRequestHandler):
             return self._json(200, {"status": "ok", "service": "hybrid",
                                     "version": hybrid.__version__})
         if not self._authed():
-            return
+            return None                      # _authed already sent the 401
         if path.endswith("/models"):
             return self._json(200, {"object": "list",
                                     "data": [{"id": "hybrid", "object": "model",
@@ -135,7 +135,7 @@ class H(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if not self._authed():
-            return
+            return None                      # _authed already sent the 401
         if not self.path.split("?")[0].rstrip("/").endswith("/chat/completions"):
             return self._json(404, {"error": {"message": "not found",
                                               "type": "invalid_request_error"}})
@@ -225,7 +225,7 @@ class H(BaseHTTPRequestHandler):
             ):
                 self.wfile.write(b"data: " + json.dumps(chunk).encode() + b"\n\n")
             self.wfile.write(b"data: [DONE]\n\n")
-            return
+            return None                      # stream already written
 
         return self._json(200, {
             "id": "chatcmpl-hybrid", "object": "chat.completion", "created": created,
