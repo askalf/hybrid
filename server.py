@@ -131,7 +131,7 @@ class H(BaseHTTPRequestHandler):
             return self._json(200, {"object": "list",
                                     "data": [{"id": "hybrid", "object": "model",
                                               "owned_by": "local"}]})
-        self._json(404, {"error": {"message": "not found", "type": "invalid_request_error"}})
+        return self._json(404, {"error": {"message": "not found", "type": "invalid_request_error"}})
 
     def do_POST(self):
         if not self._authed():
@@ -227,7 +227,7 @@ class H(BaseHTTPRequestHandler):
             self.wfile.write(b"data: [DONE]\n\n")
             return
 
-        self._json(200, {
+        return self._json(200, {
             "id": "chatcmpl-hybrid", "object": "chat.completion", "created": created,
             "model": model,
             "choices": [{"index": 0, "finish_reason": "stop",
