@@ -1,6 +1,7 @@
 # hybrid — local-first LLM routing with frontier escalation
 
 [![tests](https://github.com/askalf/hybrid/actions/workflows/test.yml/badge.svg)](https://github.com/askalf/hybrid/actions/workflows/test.yml)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/askalf/hybrid/badge)](https://scorecard.dev/viewer/?uri=github.com/askalf/hybrid)
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/askalf/hybrid/main/og.png" alt="hybrid: answer the easy majority locally, escalate the few that earn it" width="840">
