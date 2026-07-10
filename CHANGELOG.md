@@ -45,6 +45,19 @@ and not over-generating, not from a faster kernel.
   to 30 with the fused decision table.
 - Ollama transport behavior is byte-identical to v1.6.1 by default (the `grammar`
   argument is ignored by the generate API; fusion is opt-in everywhere).
+- **Split-server fast tier** (`LLAMACPP_URL_FAST`): llama-server loads one model, so
+  the split-model policy gets a second server — vote/creative calls (they pass
+  `model=LOCAL_MODEL_FAST`) route to it, transcription never does. Same pinned
+  safety rule as the Ollama transport, enforced by URL. Measured, and OPT-IN for a reason: on llama.cpp b9660 the 3B voted 'Brazil'
+  for the 2014 World Cup — 3/3 self-consistent, served in 1.5 s. A factual
+  wrong-served the 7B does not make on this runtime, and a direct demonstration
+  that the '3B is safe on votes' result was itself runtime-specific. The
+  mechanism ships; the trade is yours, with the receipt attached.
+- **Vote budget trimmed** to 56 tokens (CONCISE asks for a number, a word, or a
+  sentence or two; past that is decode spent on a ramble no key extraction reads),
+  and `HYBRID_VOTE_FAST=1` (opt-in) votes 2-of-2 instead of 3-of-3 — one fewer
+  decode, strictly more escalation-prone on disagreement. Measured: bench wall 2 m 03 s -> 1 m 28 s (-28%), but a 2/2 vote agreed-wrong on a
+  trap the 3/3 vote escalated. Off by default.
 
 ## v1.6.1 — 2026-07-03
 

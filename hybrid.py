@@ -81,6 +81,13 @@ OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434/api/generate")
 # transcription itself. See _fused().)
 LOCAL_BACKEND = os.environ.get("HYBRID_LOCAL_BACKEND", "ollama")
 LLAMACPP_URL = os.environ.get("LLAMACPP_URL", "http://127.0.0.1:8080/completion")
+# llama-server loads ONE model, so the split-model policy (LOCAL_MODEL_FAST for the
+# vote/creative tiers, never for transcription) needs a SECOND server: point
+# LLAMACPP_URL_FAST at a llama-server holding the fast model and every call the tiers
+# make with model=LOCAL_MODEL_FAST routes there. Decode is bandwidth-bound, so a 3B
+# answers a vote sample ~2.8x faster than the 7B for the same bytes/sec. Unset, all
+# calls go to LLAMACPP_URL — single-server behavior, unchanged.
+LLAMACPP_URL_FAST = os.environ.get("LLAMACPP_URL_FAST", "")
 # Chat template for the llamacpp transport (raw /completion bypasses the GGUF's built-in
 # template). Default is ChatML (the Qwen family). {sys} = tier instructions -> a stable,
 # cacheable prefix; {user} = the query.
@@ -262,7 +269,12 @@ def ollama(prompt, num_predict=256, temperature=0.0, model=None, grammar=None):
     the server loaded). `grammar` is ignored on the Ollama transport — the generate
     API has no grammar parameter."""
     if LOCAL_BACKEND == "llamacpp":
-        url = LLAMACPP_URL
+        # the fast-tier calls (they pass model=LOCAL_MODEL_FAST) go to the fast server
+        # when one is configured; transcription calls never do — same pinned policy as
+        # the Ollama transport, enforced by URL instead of model name.
+        fast = (LLAMACPP_URL_FAST and model is not None
+                and model == LOCAL_MODEL_FAST and model != LOCAL_MODEL)
+        url = LLAMACPP_URL_FAST if fast else LLAMACPP_URL
         body = json.dumps(_llamacpp_body(prompt, num_predict, temperature, grammar)).encode()
     else:
         url = OLLAMA_URL
@@ -330,17 +342,27 @@ def local_consistency(query, k=3):
     once per token-step for all k samples — the vote costs roughly ONE sample's wall
     time instead of k. Against a serial server the requests just queue: same behavior,
     same total time as the old loop. A BackendError in any sample re-raises here, so
-    the failure policy sees exactly what it saw before."""
+    the failure policy sees exactly what it saw before.
+
+    HYBRID_VOTE_FAST=1 (opt-in) samples 2 instead of 3 and requires 2/2 — one fewer
+    decode, and STRICTLY more escalation-prone on disagreement (there is no third
+    sample to complete a unanimity). The trade is confidence-evidence for wall time:
+    2/2 at temperature 0.6 is weaker evidence than 3/3. Measured before shipping;
+    see the README table. The vote budget is 56 tokens — CONCISE asks for a number,
+    a word, or a sentence or two, and everything past that is decode spent on a
+    ramble no key extraction reads."""
+    if os.environ.get("HYBRID_VOTE_FAST", "") == "1":
+        k = 2
     t0 = time.time()
     with ThreadPoolExecutor(max_workers=k) as ex:
-        futures = [ex.submit(ollama, CONCISE.format(q=query), 80, 0.6, LOCAL_MODEL_FAST)
+        futures = [ex.submit(ollama, CONCISE.format(q=query), 56, 0.6, LOCAL_MODEL_FAST)
                    for _ in range(k)]
         samples = [f.result()[0] for f in futures]
     t = time.time() - t0
     keys = [_key(s) for s in samples]
     top, n = Counter(keys).most_common(1)[0]
     best = next(s for s, kk in zip(samples, keys) if kk == top)
-    return (n >= k), best, n, t  # unanimous: escalate unless the model fully agrees with itself
+    return (n >= k), best, f"{n}/{k}", t  # unanimous: escalate unless the model fully agrees with itself
 
 
 def route(query, messages=None):
@@ -446,7 +468,7 @@ def _route(query, messages=None):
     # 4. everything else -> self-consistency decides.
     confident, best, agree, ct = local_consistency(query)
     if confident:
-        return {"route": "LOCAL", "why": f"self-consistent {agree}/3",
+        return {"route": "LOCAL", "why": f"self-consistent {agree}",
                 "backend": LOCAL_MODEL_FAST,
                 "answer": best, "router_s": round(ct, 2), "answer_s": 0.0}
     ans, dt = _escalate(query, messages)
@@ -508,7 +530,7 @@ def _route_two_call(query, messages):
     # 4. everything else -> self-consistency decides.
     confident, best, agree, ct = local_consistency(query)
     if confident:
-        return {"route": "LOCAL", "why": f"self-consistent {agree}/3",
+        return {"route": "LOCAL", "why": f"self-consistent {agree}",
                 "backend": LOCAL_MODEL_FAST,
                 "answer": best, "router_s": round(ct, 2), "answer_s": 0.0}
     ans, dt = _escalate(query, messages)
