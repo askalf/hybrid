@@ -59,7 +59,7 @@ import equations
 import templates
 import verify
 
-__version__ = "1.6.1"
+__version__ = "1.7.0"
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # Windows cp1252 chokes on non-ASCII
@@ -67,6 +67,26 @@ except Exception:
     pass  # best-effort console tweak; stdout may be replaced/unreconfigurable (tests, pipes)
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434/api/generate")
+# Local transport: "ollama" (default, /api/generate) or "llamacpp" (llama-server's native
+# /completion). llama.cpp buys three things Ollama's generate API can't give the router:
+#   - cache_prompt: each tier's fixed instruction preamble is prefilled ONCE and reused —
+#     on a CPU, prefill is the compute-bound wall, and this measured ~5s/call on a 2013
+#     Haswell (128-token preamble -> 24-token warm prefill).
+#   - grammar: GBNF-locked EQN/CHECK/ANSWER output. The failure it kills is the RAMBLE:
+#     the same 7B that answers a rate problem in 23 tokens will, unconstrained, write 210
+#     tokens of LaTeX the parsers can't read (measured 54s -> 6.5s) and then cost a SECOND
+#     call when the tier falls through.
+# (A fourth idea — FUSING setup+verify into one call — is implemented but
+# experimental and OFF by default: measured, the double duty degrades the
+# transcription itself. See _fused().)
+LOCAL_BACKEND = os.environ.get("HYBRID_LOCAL_BACKEND", "ollama")
+LLAMACPP_URL = os.environ.get("LLAMACPP_URL", "http://127.0.0.1:8080/completion")
+# Chat template for the llamacpp transport (raw /completion bypasses the GGUF's built-in
+# template). Default is ChatML (the Qwen family). {sys} = tier instructions -> a stable,
+# cacheable prefix; {user} = the query.
+PROMPT_WRAP = os.environ.get(
+    "HYBRID_PROMPT_WRAP",
+    "<|im_start|>system\n{sys}<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n")
 LOCAL_MODEL = os.environ.get("LOCAL_MODEL", "qwen2.5:7b")
 # The vote/creative tiers tolerate a smaller, faster model: their outputs are either
 # voted on or have no single right answer. The transcription tiers do NOT (a weaker
@@ -122,6 +142,71 @@ SETUP_PROMPT = (
     "    ANSWER: <name> = <number>\n"
     "Question: {q}")
 
+# One transcription call instead of two: EQN lines + ANSWER + CHECK lines in a single
+# response. The router reads the strongest signal first — a solvable EQN system is a
+# re-derivation (equations.py); only when nothing derives do the CHECK lines get graded
+# (verify.py); only when nothing checks does the vote run. Same precedence as the
+# two-call flow, one prefill+decode cheaper every time the setup tier used to fall
+# through. Live-measured: the 7B produces all three sections cleanly in ~30-60 tokens.
+FUSED_PROMPT = (
+    "Set the problem up as equations, solve it, then verify by substitution.\n"
+    "You may reason briefly first, each thought on its own line starting with THINK: .\n"
+    "Then write each relationship the PROBLEM states as one equation line, using a short "
+    "one-word name for each unknown quantity and * for multiplication:\n"
+    "    EQN: <equation>\n"
+    "Every EQN must restate a fact from the problem itself, not a step of your solution.\n"
+    "Then give the answer, naming the unknown it is the value of:\n"
+    "    ANSWER: <name> = <number>\n"
+    "Then substitute YOUR numbers into the problem's relationships and write each as a "
+    "line containing ONLY digits and + - * / ( ):\n"
+    "    CHECK: <numbers only> = <number>\n"
+    "Question: {q}")
+
+# GBNF grammars (llamacpp transport only). They lock the transcription tiers to exactly
+# the line shapes the oracles parse — killing the ramble class and the units-inside-CHECK
+# class at the sampler. Written to fight the model as little as possible: capitals
+# allowed (equations.py parses case-insensitively), optional blank lines between
+# sections, and — load-bearing — a BOUNDED think block up front. The first grammar cut
+# had no think room and transcription quality collapsed on exactly the trap classes the
+# derive tier exists for (chicken cracked -> wrong-served, Sally caught -> wrong-served,
+# feet-and-inches correct -> mangled): the prose these prompts used to permit WAS the
+# model's chain of thought. THINK: lines give it back — capped at 6 x 220 chars, and
+# invisible to the parsers. The ANSWER number keeps an optional % (a percent answer
+# forced unitless came back as 0.99, served in place of 99%). ⚠ GBNF character classes
+# have NO `\-` escape — a dash goes LAST in the class, unescaped. llama-server SILENTLY
+# ignores an unparseable grammar (it logs and generates unconstrained), so these
+# strings are pinned by tests: a typo here would not crash anything, it would quietly
+# disarm the constraint.
+GRAMMAR_SETUP = (
+    'root ::= think{0,6} eqn{1,6} answer\n'
+    'think ::= "THINK: " [^\\n]{3,220} "\\n" "\\n"?\n'
+    'eqn ::= "EQN: " side " = " side "\\n" "\\n"?\n'
+    'answer ::= "ANSWER: " name " = " num "\\n"?\n'
+    'side ::= [A-Za-z0-9+*/(). _-]+\n'
+    'name ::= [A-Za-z_]+\n'
+    'num ::= "-"? [0-9]+ ("." [0-9]+)? ("/" [0-9]+)? "%"?\n')
+GRAMMAR_FUSED = (
+    'root ::= think{0,6} eqn{1,6} answer check{1,4}\n'
+    'think ::= "THINK: " [^\\n]{3,220} "\\n" "\\n"?\n'
+    'eqn ::= "EQN: " side " = " side "\\n" "\\n"?\n'
+    'answer ::= "ANSWER: " name " = " num "\\n" "\\n"?\n'
+    'check ::= "CHECK: " dexpr " = " num "\\n"? "\\n"?\n'
+    'side ::= [A-Za-z0-9+*/(). _-]+\n'
+    'name ::= [A-Za-z_]+\n'
+    'num ::= "-"? [0-9]+ ("." [0-9]+)? ("/" [0-9]+)? "%"?\n'
+    'dexpr ::= [0-9+*/(). -]+\n')
+
+
+def _fused():
+    """Is the one-call fused transcription tier on? EXPERIMENTAL, default OFF
+    (HYBRID_FUSE=1 opts in). Measured live before demotion: asking one call to
+    transcribe AND self-check interferes with the transcription itself — mixed-unit
+    conversions the setup tier transcribes correctly (5 ft 4 in -> 162.56 cm) came
+    back mangled (5.33), and a percent answer lost its unit — and the plug-back
+    tier then graded the mangled answer's true-but-disconnected arithmetic as
+    'checked'. One call is only cheaper if its answers stay worth serving."""
+    return os.environ.get("HYBRID_FUSE", "") == "1"
+
 
 def _fmt(x):
     return str(int(x)) if float(x).is_integer() else f"{x:.4g}"
@@ -153,27 +238,52 @@ def _quantitative(q):
     return any(ch.isdigit() for ch in q) or len(_NUMBER_WORD.findall(q)) >= 2
 
 
-def ollama(prompt, num_predict=256, temperature=0.0, model=None):
+def _llamacpp_body(prompt, num_predict, temperature, grammar):
+    """Request body for llama-server's native /completion. Every tier prompt ends with
+    '\\nQuestion: <q>', so the split below puts the FIXED instructions in the template's
+    {sys} slot and only the query in {user} — that makes the instructions a stable
+    prefix, which is what cache_prompt amortizes across calls."""
+    instr, _, q = prompt.rpartition("\nQuestion: ")
+    wrapped = (PROMPT_WRAP.format(sys=instr, user="Question: " + q) if instr
+               else PROMPT_WRAP.format(sys="", user=prompt))
+    body = {"prompt": wrapped, "n_predict": num_predict, "temperature": temperature,
+            "cache_prompt": True, "stop": ["<|im_end|>"]}
+    if grammar and os.environ.get("HYBRID_GRAMMAR", "1") != "0":
+        body["grammar"] = grammar
+    return body
+
+
+def ollama(prompt, num_predict=256, temperature=0.0, model=None, grammar=None):
     """One local-model call (default LOCAL_MODEL; the vote/creative tiers pass
     LOCAL_MODEL_FAST). Retries once (transports flake), then raises BackendError —
-    an answer string is ALWAYS a real model answer, never an error in disguise."""
-    body = json.dumps({
-        "model": model or LOCAL_MODEL, "prompt": prompt, "stream": False, "keep_alive": "5m",
-        "options": {"num_predict": num_predict, "temperature": temperature},
-    }).encode()
+    an answer string is ALWAYS a real model answer, never an error in disguise.
+    With HYBRID_LOCAL_BACKEND=llamacpp the same call goes to llama-server's native
+    /completion instead (prefix cache + optional GBNF grammar; `model` is whatever
+    the server loaded). `grammar` is ignored on the Ollama transport — the generate
+    API has no grammar parameter."""
+    if LOCAL_BACKEND == "llamacpp":
+        url = LLAMACPP_URL
+        body = json.dumps(_llamacpp_body(prompt, num_predict, temperature, grammar)).encode()
+    else:
+        url = OLLAMA_URL
+        body = json.dumps({
+            "model": model or LOCAL_MODEL, "prompt": prompt, "stream": False, "keep_alive": "5m",
+            "options": {"num_predict": num_predict, "temperature": temperature},
+        }).encode()
     t0 = time.time()
     last = None
     for attempt in (1, 2):
         try:
-            req = urllib.request.Request(OLLAMA_URL, data=body,
+            req = urllib.request.Request(url, data=body,
                                          headers={"content-type": "application/json"})
             r = json.loads(urllib.request.urlopen(req, timeout=300).read())
-            return r.get("response", "").strip(), time.time() - t0
+            text = r.get("content", "") if LOCAL_BACKEND == "llamacpp" else r.get("response", "")
+            return text.strip(), time.time() - t0
         except Exception as e:
             last = e
             if attempt == 1:
                 time.sleep(1.0)
-    raise BackendError("local", f"{model or LOCAL_MODEL} at {OLLAMA_URL}: {last}")
+    raise BackendError("local", f"{model or LOCAL_MODEL} at {url}: {last}")
 
 
 def escalate(query, messages=None):
@@ -295,52 +405,106 @@ def _route(query, messages=None):
     # 3. quantitative queries get the exact oracle, strongest signal first:
     #    derive (independent re-derivation) > plug-back (consistency) > vote (agreement).
     if _quantitative(query):
-        # setup re-derivation (equations.py): the model transcribes the problem's
-        # relationships as equations, we solve the linear system OURSELVES (exact
-        # Fractions, free) and compare to its answer. A mismatch means the model
-        # mis-solved its own transcription -> HARD escalate. This runs FIRST because
-        # plug-back can be fooled by a tautology (a true-but-disconnected check like
-        # `(1.5/1.5)*1 = 1` reads as "checked"); a derivation can't — it produces its
-        # own value for the answer instead of grading the model's checks.
-        raw, dt = ollama(SETUP_PROMPT.format(q=query), num_predict=220, temperature=0.0)
-        st, info = equations.verdict(raw)
-        if st == "mismatch":
-            esc, et = _escalate(query, messages)
-            return {"route": "ESCALATE",
-                    "why": (f"setup derives {info['var']}="
-                            f"{equations.fmt(info['derived'])}≠{_fmt(info['claimed'])}"),
-                    "backend": FRONTIER_MODEL, "answer": esc,
-                    "router_s": round(dt, 2), "answer_s": round(et, 2)}
-        if st == "derived":
-            # serve the value we RE-DERIVED (== the model's answer, but exact and clean —
-            # the model may have phrased its ANSWER line in LaTeX or prose)
-            return {"route": "LOCAL", "why": f"setup re-derived ({info['eqns']} eqn)",
-                    "backend": LOCAL_MODEL, "answer": equations.fmt(info["derived"]),
-                    "router_s": 0.0, "answer_s": round(dt, 2)}
+        if _fused():
+            # One transcription call carries every signal. Precedence is IDENTICAL to
+            # the two-call flow below: a derive verdict (strongest) wins outright — a
+            # sloppy CHECK next to a confirmed derivation must not escalate an answer
+            # the exact solver just re-derived (live case: the self-referential brick).
+            raw, dt = ollama(FUSED_PROMPT.format(q=query), num_predict=380,
+                             temperature=0.0, grammar=GRAMMAR_FUSED)
+            st, info = equations.verdict(raw)
+            if st == "mismatch":
+                esc, et = _escalate(query, messages)
+                return {"route": "ESCALATE",
+                        "why": (f"setup derives {info['var']}="
+                                f"{equations.fmt(info['derived'])}≠{_fmt(info['claimed'])}"),
+                        "backend": FRONTIER_MODEL, "answer": esc,
+                        "router_s": round(dt, 2), "answer_s": round(et, 2)}
+            if st == "derived":
+                return {"route": "LOCAL", "why": f"setup re-derived ({info['eqns']} eqn, fused)",
+                        "backend": LOCAL_MODEL, "answer": equations.fmt(info["derived"]),
+                        "router_s": 0.0, "answer_s": round(dt, 2)}
+            status, claims = verify.verdict(raw)
+            if status == "wrong":
+                bad = next(c for c in claims if not c["ok"])
+                kind = "constraint violated" if re.search(r"[a-z]", bad["expr"], re.I) else "local math wrong"
+                esc, et = _escalate(query, messages)
+                return {"route": "ESCALATE",
+                        "why": f"{kind} ({bad['expr']}={_fmt(bad['claimed'])}≠{_fmt(bad['actual'])})",
+                        "backend": FRONTIER_MODEL, "answer": esc,
+                        "router_s": round(dt, 2), "answer_s": round(et, 2)}
+            if status == "checked":
+                answer = verify.answer_text(raw) or _fmt(claims[-1]["actual"])
+                kind = "constraints hold" if verify.has_constraint(claims) else "arithmetic checks"
+                return {"route": "LOCAL", "why": f"{kind} ({len(claims)} eqn, fused)",
+                        "backend": LOCAL_MODEL, "answer": answer,
+                        "router_s": 0.0, "answer_s": round(dt, 2)}
+            # neither derivable nor checkable -> fall through to the vote, having spent
+            # ONE call where the two-call flow would by now have spent two.
+        else:
+            return _route_two_call(query, messages)
+    # 4. everything else -> self-consistency decides.
+    confident, best, agree, ct = local_consistency(query)
+    if confident:
+        return {"route": "LOCAL", "why": f"self-consistent {agree}/3",
+                "backend": LOCAL_MODEL_FAST,
+                "answer": best, "router_s": round(ct, 2), "answer_s": 0.0}
+    ans, dt = _escalate(query, messages)
+    return {"route": "ESCALATE", "why": "uncertain (self-inconsistent)", "backend": FRONTIER_MODEL,
+            "answer": ans, "router_s": round(ct, 2), "answer_s": round(dt, 2)}
 
-        # nothing derivable (no clean linear system) -> plug-back verify: the model
-        # answers and states its calculation; we re-check that arithmetic exactly. A
-        # false equation is a HARD escalate signal (the model's own stated math is
-        # wrong), not a vote. Correct arithmetic we trust. Nothing checkable -> vote.
-        raw2, dt2 = ollama(VERIFY_PROMPT.format(q=query), num_predict=220, temperature=0.0)
-        status, claims = verify.verdict(raw2)
-        if status == "wrong":
-            bad = next(c for c in claims if not c["ok"])
-            # a variable in the failed expr means it was a CHECK (the answer is inconsistent
-            # with a problem constraint); a bare expr means the model's own arithmetic is off.
-            kind = "constraint violated" if re.search(r"[a-z]", bad["expr"], re.I) else "local math wrong"
-            esc, et = _escalate(query, messages)
-            return {"route": "ESCALATE",
-                    "why": f"{kind} ({bad['expr']}={_fmt(bad['claimed'])}≠{_fmt(bad['actual'])})",
-                    "backend": FRONTIER_MODEL, "answer": esc,
-                    "router_s": round(dt + dt2, 2), "answer_s": round(et, 2)}
-        if status == "checked":
-            # the model may have put the value only in the working lines; show the answer
-            answer = verify.answer_text(raw2) or _fmt(claims[-1]["actual"])
-            kind = "constraints hold" if verify.has_constraint(claims) else "arithmetic checks"
-            return {"route": "LOCAL", "why": f"{kind} ({len(claims)} eqn)",
-                    "backend": LOCAL_MODEL, "answer": answer,
-                    "router_s": round(dt, 2), "answer_s": round(dt2, 2)}
+
+def _route_two_call(query, messages):
+    """The pre-fusion quantitative path: setup call, then (on fall-through) a separate
+    plug-back call, then the vote. Byte-identical behavior to v1.6.x — the Ollama
+    transport's measured default until fusion is re-benched there."""
+    # setup re-derivation (equations.py): the model transcribes the problem's
+    # relationships as equations, we solve the linear system OURSELVES (exact
+    # Fractions, free) and compare to its answer. A mismatch means the model
+    # mis-solved its own transcription -> HARD escalate. This runs FIRST because
+    # plug-back can be fooled by a tautology (a true-but-disconnected check like
+    # `(1.5/1.5)*1 = 1` reads as "checked"); a derivation can't — it produces its
+    # own value for the answer instead of grading the model's checks.
+    raw, dt = ollama(SETUP_PROMPT.format(q=query), num_predict=220, temperature=0.0,
+                     grammar=GRAMMAR_SETUP)
+    st, info = equations.verdict(raw)
+    if st == "mismatch":
+        esc, et = _escalate(query, messages)
+        return {"route": "ESCALATE",
+                "why": (f"setup derives {info['var']}="
+                        f"{equations.fmt(info['derived'])}≠{_fmt(info['claimed'])}"),
+                "backend": FRONTIER_MODEL, "answer": esc,
+                "router_s": round(dt, 2), "answer_s": round(et, 2)}
+    if st == "derived":
+        # serve the value we RE-DERIVED (== the model's answer, but exact and clean —
+        # the model may have phrased its ANSWER line in LaTeX or prose)
+        return {"route": "LOCAL", "why": f"setup re-derived ({info['eqns']} eqn)",
+                "backend": LOCAL_MODEL, "answer": equations.fmt(info["derived"]),
+                "router_s": 0.0, "answer_s": round(dt, 2)}
+
+    # nothing derivable (no clean linear system) -> plug-back verify: the model
+    # answers and states its calculation; we re-check that arithmetic exactly. A
+    # false equation is a HARD escalate signal (the model's own stated math is
+    # wrong), not a vote. Correct arithmetic we trust. Nothing checkable -> vote.
+    raw2, dt2 = ollama(VERIFY_PROMPT.format(q=query), num_predict=220, temperature=0.0)
+    status, claims = verify.verdict(raw2)
+    if status == "wrong":
+        bad = next(c for c in claims if not c["ok"])
+        # a variable in the failed expr means it was a CHECK (the answer is inconsistent
+        # with a problem constraint); a bare expr means the model's own arithmetic is off.
+        kind = "constraint violated" if re.search(r"[a-z]", bad["expr"], re.I) else "local math wrong"
+        esc, et = _escalate(query, messages)
+        return {"route": "ESCALATE",
+                "why": f"{kind} ({bad['expr']}={_fmt(bad['claimed'])}≠{_fmt(bad['actual'])})",
+                "backend": FRONTIER_MODEL, "answer": esc,
+                "router_s": round(dt + dt2, 2), "answer_s": round(et, 2)}
+    if status == "checked":
+        # the model may have put the value only in the working lines; show the answer
+        answer = verify.answer_text(raw2) or _fmt(claims[-1]["actual"])
+        kind = "constraints hold" if verify.has_constraint(claims) else "arithmetic checks"
+        return {"route": "LOCAL", "why": f"{kind} ({len(claims)} eqn)",
+                "backend": LOCAL_MODEL, "answer": answer,
+                "router_s": round(dt, 2), "answer_s": round(dt2, 2)}
     # 4. everything else -> self-consistency decides.
     confident, best, agree, ct = local_consistency(query)
     if confident:
