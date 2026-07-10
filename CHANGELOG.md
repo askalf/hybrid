@@ -3,6 +3,49 @@
 All notable changes to hybrid are documented here. This project adheres to
 [Semantic Versioning](https://semver.org).
 
+## v1.7.0 — 2026-07-10
+
+The GPU-less fast path: a native **llama.cpp transport** for the local tier
+(`HYBRID_LOCAL_BACKEND=llamacpp`), built from measured CPU physics — prefill is
+compute-bound and decode is bandwidth-bound, so the wins come from not re-prefilling
+and not over-generating, not from a faster kernel.
+
+- **Prefix caching**: tier instructions ride in the template's system slot and
+  `cache_prompt: true` re-uses their prefill across calls — a transcription call's
+  prefill drops from ~128 tokens to ~24 after the first (measured ~5 s/call back on a
+  2013 Haswell; the preamble is the majority of most tier prompts).
+- **GBNF grammars** lock the transcription tiers to exactly the `EQN:`/`ANSWER:`/
+  `CHECK:` shapes the oracles parse. Kills the ramble class (measured worst live case:
+  210 tokens of unparseable LaTeX in 54 s → 23 clean tokens in 6.5 s) and the
+  units-inside-CHECK fall-through class. `HYBRID_GRAMMAR=0` opts out. llama-server
+  silently ignores malformed grammars, so the grammar strings are pinned by tests.
+- **Fused transcription tier — EXPERIMENTAL, off by default** (`HYBRID_FUSE=1` opts
+  in): ONE model call for equations + answer + substitution checks, read
+  strongest-signal-first with two-call precedence (derive out-ranks a sloppy false
+  CHECK — the self-referential brick case, pinned by a test). Measured ~2.2× end to
+  end, and then measured why it stays off: transcribe-AND-self-check in one call
+  degrades the transcription itself (a mixed-unit conversion the setup tier gets
+  exactly right came back mangled, a percent answer lost its unit), and plug-back then
+  grades the mangled answer's true-but-disconnected arithmetic as "checked".
+- The grammars carry a **bounded THINK block** (up to 6 × 220-char lines, invisible to
+  the parsers): the first cut had no think room and transcription quality collapsed on
+  exactly the trap classes the derive tier exists for — the prose the prompts used to
+  permit WAS the model's chain of thought.
+- **Honest finding, promoted to the README:** the classic setup traps are
+  runtime-FRAGILE at temperature 0 — the same model + prompts flip between cracked /
+  caught / wrong-served across llama.cpp builds and transports, independent of
+  grammar, temperature, and prompt wrap. "Zero wrong served" on that class is a fact
+  about a runtime build; the runtime-stable safety is the deterministic tiers. Bench
+  tables now state the runtime.
+- New `test_backend.py` (44 checks): the transport against a real loopback fake —
+  ChatML wrap, system-slot instructions, cache/stop/n_predict fields, grammar
+  attach/opt-out, retry-once + BackendError, fusion-off default — plus grammar sanity
+  pins (GBNF has no `\-` class escape; a literal dash sits last; llama-server silently
+  ignores a malformed grammar, so a typo would quietly disarm it). Route suite grows
+  to 30 with the fused decision table.
+- Ollama transport behavior is byte-identical to v1.6.1 by default (the `grammar`
+  argument is ignored by the generate API; fusion is opt-in everywhere).
+
 ## v1.6.1 — 2026-07-03
 
 - **The self-consistency vote fires its k samples concurrently** (stdlib

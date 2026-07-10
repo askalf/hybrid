@@ -37,23 +37,29 @@ def check(name, cond, detail=""):
 
 class FakeModel:
     """Stands in for hybrid.ollama. The prompt template identifies the tier asking:
-    SETUP_PROMPT carries 'EQN:', VERIFY_PROMPT carries 'CHECK:', CONCISE neither."""
+    FUSED_PROMPT carries both 'EQN:' and 'CHECK:', SETUP_PROMPT only 'EQN:',
+    VERIFY_PROMPT only 'CHECK:', CONCISE neither."""
 
     def __init__(self, setup="no equations here", verify="no checks here",
-                 concise=None, fail=False):
-        self.setup, self.verify = setup, verify
+                 fused="nothing derivable or checkable", concise=None, fail=False):
+        self.setup, self.verify, self.fused = setup, verify, fused
         self.concise = list(concise or [])
         self.fail = fail
         self.kinds = []
         self.models = []
+        self.grammars = []
 
-    def __call__(self, prompt, num_predict=256, temperature=0.0, model=None):
-        kind = ("setup" if "EQN:" in prompt else
+    def __call__(self, prompt, num_predict=256, temperature=0.0, model=None, grammar=None):
+        kind = ("fused" if ("EQN:" in prompt and "CHECK:" in prompt) else
+                "setup" if "EQN:" in prompt else
                 "verify" if "CHECK:" in prompt else "concise")
         self.kinds.append(kind)
         self.models.append(model)
+        self.grammars.append(grammar)
         if self.fail:
             raise hybrid.BackendError("local", "connection refused (fake)")
+        if kind == "fused":
+            return self.fused, 0.0
         if kind == "setup":
             return self.setup, 0.0
         if kind == "verify":
@@ -230,6 +236,61 @@ def main():
     r = run("What is the capital of Japan?", fm, ff)
     check("both backends down -> ERROR, never an answer-shaped string",
           r["route"] == "ERROR" and r.get("error") is True, r["why"])
+
+    # --- 6. fused transcription tier (HYBRID_FUSE=1; default on llamacpp) ------
+    FUSE = {"HYBRID_FUSE": "1"}
+    fused_ok = BAT_EQNS + "0.05\nCHECK: 0.05 + 1.05 = 1.10"
+    fm, ff = FakeModel(fused=fused_ok), FakeFrontier()
+    r = run(BAT_ODD, fm, ff, env=FUSE)
+    check("fused: derive serves in ONE call",
+          r["route"] == "LOCAL" and "fused" in r["why"] and fm.kinds == ["fused"]
+          and r["answer"] == "0.05" and ff.calls == 0, ",".join(fm.kinds))
+    check("fused: the transcription call carries the fused grammar",
+          fm.grammars == [hybrid.GRAMMAR_FUSED], str(fm.grammars)[:44])
+
+    fm, ff = FakeModel(fused=BAT_EQNS + "0.10\nCHECK: 0.10 + 1.10 = 1.10"), FakeFrontier("$0.05.")
+    r = run(BAT_ODD, fm, ff, env=FUSE)
+    check("fused: derive mismatch -> hard escalate",
+          r["route"] == "ESCALATE" and r["why"].startswith("setup derives") and ff.calls == 1,
+          r["why"])
+
+    # a sloppy false CHECK next to a CONFIRMED derive must not escalate (the
+    # self-referential brick, live): derive verdict out-ranks plug-back.
+    brick = ("EQN: b = 1 + 0.5 * b\nANSWER: b = 2\nCHECK: 2 = 1.5")
+    fm, ff = FakeModel(fused=brick), FakeFrontier()
+    r = run("A brick weighs 1 kg plus half a brick. What does the brick weigh in kg? "
+            "Give a number.", fm, ff, env=FUSE)
+    check("fused: derive verdict out-ranks a sloppy false CHECK",
+          r["route"] == "LOCAL" and r["answer"] == "2" and ff.calls == 0, r["why"])
+
+    # nothing derivable, but a FALSE check -> hard escalate (plug-back still armed)
+    fm, ff = FakeModel(fused="ANSWER: total = 85\nCHECK: 7 * 12.50 = 85"), FakeFrontier("$87.50")
+    r = run("A pen costs $12.50. What do 7 pens cost, given a 0-dollar discount?", fm, ff, env=FUSE)
+    check("fused: false CHECK (no derive) -> hard escalate",
+          r["route"] == "ESCALATE" and "local math wrong" in r["why"] and ff.calls == 1,
+          r["why"])
+
+    # nothing derivable, checks hold -> served off the same single call
+    fm, ff = FakeModel(fused="ANSWER: total = 87.5\nCHECK: 7 * 12.50 = 87.5"), FakeFrontier()
+    r = run("A pen costs $12.50. What do 7 pens cost, given a 0-dollar discount?", fm, ff, env=FUSE)
+    check("fused: checks hold -> LOCAL in one call",
+          r["route"] == "LOCAL" and "fused" in r["why"] and fm.kinds == ["fused"]
+          and ff.calls == 0, r["why"])
+
+    # nothing derivable NOR checkable -> falls through to the vote (1 fused + 3 votes)
+    fm, ff = FakeModel(fused="I am not sure.", concise=["42", "42", "42"]), FakeFrontier()
+    r = run("A widget batch has 3 dozen plus 6 widgets. How many is that?", fm, ff, env=FUSE)
+    check("fused: nothing usable falls through to the vote",
+          r["route"] == "LOCAL" and fm.kinds == ["fused", "concise", "concise", "concise"],
+          ",".join(fm.kinds))
+
+    # default (ollama transport): fusion OFF -> the two-call flow, setup first
+    fm, ff = FakeModel(), FakeFrontier()
+    r = run(BAT_ODD, fm, ff, env={"HYBRID_FUSE": "0"})
+    check("HYBRID_FUSE=0 keeps the two-call flow (setup then verify)",
+          fm.kinds[:2] == ["setup", "verify"], ",".join(fm.kinds))
+    check("two-call setup carries the setup grammar",
+          fm.grammars and fm.grammars[0] == hybrid.GRAMMAR_SETUP, str(fm.grammars[0])[:40])
 
     print("-" * 72)
     if FAILS:

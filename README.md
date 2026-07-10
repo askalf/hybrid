@@ -182,7 +182,7 @@ python test_solver.py                          # solver tests (53/53, no model n
 python test_templates.py                       # template transcriber tests (58/58, no model needed)
 python test_verify.py                          # verifier tests (28/28, no model needed)
 python test_equations.py                       # setup re-derivation tests (45/45, no model needed)
-python test_route.py                           # router plumbing + failure policy (21/21, no model needed)
+python test_route.py                           # router plumbing + failure policy + fused table (30/30, no model needed)
 python test_server.py                          # server surface: SSE, auth, limits, cache (22/22, no model needed)
 python bench_router.py                         # full-router benchmark: on-box %, safety, catches
 python measure_routing.py                      # router economics: $ saved vs all-frontier (needs FRONTIER_API_KEY)
@@ -192,7 +192,71 @@ python server.py                               # OpenAI-compatible server on :80
 ```
 
 The oracle tiers and both harnesses (router + server tests) need **nothing** — no model,
-no network — so all 227 tests run anywhere, including CI.
+no network — so all 280 tests run anywhere, including CI.
+
+### The llama.cpp transport — the GPU-less fast path
+
+Ollama is the friendly default; llama.cpp's own server is the fast one. Point hybrid at
+a [`llama-server`](https://github.com/ggml-org/llama.cpp) and the router turns on three
+things Ollama's generate API can't express, all aimed at the two places CPU inference
+actually hurts:
+
+```bash
+llama-server -m qwen2.5-7b-instruct-q4_k_m.gguf -c 12288 --parallel 3 --port 8080
+export HYBRID_LOCAL_BACKEND=llamacpp        # LLAMACPP_URL if not :8080/completion
+python server.py
+```
+
+- **Prefix caching** (`cache_prompt`). Each tier's instruction preamble is fixed; only
+  the question changes. The transport puts the instructions in the system slot so
+  llama-server prefills them ONCE — after the first call, a transcription call prefills
+  ~24 tokens instead of ~128. On a CPU, prefill is the *compute*-bound wall that no
+  quantization fixes; measured on a 2013 Haswell this is ~5 s back **per call**.
+- **GBNF grammars.** The transcription tiers are sampled under a grammar that can only
+  produce the line shapes the oracles parse (`EQN:` / `ANSWER:` / `CHECK:`). This kills
+  the ramble class outright — the same 7B that answers a rate problem in 23 tokens
+  will, unconstrained, write 210 tokens of LaTeX the parsers can't read (measured:
+  54 s → 6.5 s on the worst live case) and then cost a SECOND call as the tier falls
+  through unparsed. A grammar also cannot write units inside a `CHECK:` line, which
+  was a documented fall-through class. `HYBRID_GRAMMAR=0` turns it off.
+#### Same box, same GGUF, two transports (i7-4770 8-thread, qwen2.5:7b Q4_K_M, frontier stubbed)
+
+| transport | bench 22q on-box | bench safety | bench wall | stress 26q on-box | stress wrong-served | stress wall |
+|---|---|---|---|---|---|---|
+| Ollama (standalone, Jun '26 build) | 18/22 | 17/18 | 3 m 23 s | 23/26 | 1 (documented class) | 9 m 59 s |
+| llama.cpp b9660, this transport | 18/22 | 16/18 | **2 m 03 s** | 23/26 | 1 (documented class) | **4 m 23 s** |
+
+Same day, same hardware, same weights: **1.65–2.3× end-to-end** from the prefix cache
+plus grammar-shortened outputs, at safety parity on the stress set — every wrong-served
+answer in every leg is the documented runtime-fragile trap class (see below), and WHICH
+member of that class slips varies by runtime build, not by transport feature.
+
+There is also an **experimental fused tier** (`HYBRID_FUSE=1`): equations + answer +
+substitution checks in ONE call, read strongest-signal-first with the same precedence
+as the two-call flow. It measured ~2.2× end-to-end — and then measured *why it stays
+off by default*: asking one call to transcribe AND self-check degrades the
+transcription itself. A mixed-unit conversion the setup tier transcribes correctly
+(5 ft 4 in → 162.56 cm) came back mangled (5.33), a percent answer lost its unit, and
+the plug-back tier then graded the mangled answer's true-but-disconnected arithmetic
+as "checked". One call is only cheaper if its answers stay worth serving.
+
+Two honest wrinkles worth knowing. llama-server **silently ignores** a grammar it
+can't parse (it logs and generates unconstrained) — so hybrid's grammars are pinned by
+tests (`test_backend.py`) rather than trusted at runtime. And the raw `/completion`
+endpoint bypasses the GGUF's chat template, so the transport wraps prompts itself —
+`HYBRID_PROMPT_WRAP` (default ChatML, the Qwen family) if your model speaks another
+dialect.
+
+**And one honest finding that outranks both:** the classic setup traps
+(chicken-and-a-half, Sally's-sisters) turn out to be **runtime-fragile** at
+temperature 0 — the same model, same prompts, flipped between cracked / caught /
+wrong-served across llama.cpp builds and transports, with or without grammars, at any
+temperature, under every prompt wrap we tried. A "zero wrong served" number on that
+trap class is a fact about one runtime build, not about the router. The tiers that are
+runtime-STABLE are exactly the deterministic ones — the solver and the template
+transcriber, which answer the shaped majority at 0 ms with no model in the loop — and
+that, not benchmark luck, is the durable safety story. Bench tables should state the
+runtime; ours do.
 
 ### The server, as a service
 
