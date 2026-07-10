@@ -219,6 +219,18 @@ python server.py
   54 s → 6.5 s on the worst live case) and then cost a SECOND call as the tier falls
   through unparsed. A grammar also cannot write units inside a `CHECK:` line, which
   was a documented fall-through class. `HYBRID_GRAMMAR=0` turns it off.
+#### Same box, same GGUF, two transports (i7-4770 8-thread, qwen2.5:7b Q4_K_M, frontier stubbed)
+
+| transport | bench 22q on-box | bench safety | bench wall | stress 26q on-box | stress wrong-served | stress wall |
+|---|---|---|---|---|---|---|
+| Ollama (standalone, Jun '26 build) | 18/22 | 17/18 | 3 m 23 s | 23/26 | 1 (documented class) | 9 m 59 s |
+| llama.cpp b9660, this transport | 18/22 | 16/18 | **2 m 03 s** | 23/26 | 1 (documented class) | **4 m 23 s** |
+
+Same day, same hardware, same weights: **1.65–2.3× end-to-end** from the prefix cache
+plus grammar-shortened outputs, at safety parity on the stress set — every wrong-served
+answer in every leg is the documented runtime-fragile trap class (see below), and WHICH
+member of that class slips varies by runtime build, not by transport feature.
+
 There is also an **experimental fused tier** (`HYBRID_FUSE=1`): equations + answer +
 substitution checks in ONE call, read strongest-signal-first with the same precedence
 as the two-call flow. It measured ~2.2× end-to-end — and then measured *why it stays
