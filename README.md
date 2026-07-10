@@ -205,6 +205,14 @@ actually hurts:
 llama-server -m qwen2.5-7b-instruct-q4_k_m.gguf -c 12288 --parallel 3 --port 8080
 export HYBRID_LOCAL_BACKEND=llamacpp        # LLAMACPP_URL if not :8080/completion
 python server.py
+
+# optional second server: the split-model policy, on llama.cpp. The vote and
+# creative tiers decode on a 3B (~2.8x the 7B at the same memory bandwidth);
+# transcription stays on the 7B - the pinned safety rule, enforced by URL:
+llama-server -m qwen2.5-3b-instruct-q4_k_m.gguf -c 8192 --parallel 3 --port 8081
+export LOCAL_MODEL_FAST=qwen2.5:3b LLAMACPP_URL_FAST=http://127.0.0.1:8081/completion
+# ^ measured before you trust it: on one llama.cpp build the 3B voted a wrong
+#   World-Cup winner 3/3 — the fast-model trade is runtime-specific. See below.
 ```
 
 - **Prefix caching** (`cache_prompt`). Each tier's instruction preamble is fixed; only

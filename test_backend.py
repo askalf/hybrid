@@ -33,6 +33,7 @@ BEHAVIOR = {"fail_times": 0}
 class FakeLlamaServer(BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["content-length"])))
+        body["_port"] = self.server.server_port
         REQUESTS.append(body)
         if BEHAVIOR["fail_times"] > 0:
             BEHAVIOR["fail_times"] -= 1
@@ -104,6 +105,27 @@ def main():
     # --- defaults ------------------------------------------------------------
     check("fusion is OFF by default, even on llamacpp (experimental opt-in)",
           not hybrid._fused(), os.environ.get("HYBRID_FUSE", "(unset)"))
+
+    # --- split-server fast tier ----------------------------------------------
+    srv_fast = HTTPServer(("127.0.0.1", 0), FakeLlamaServer)
+    threading.Thread(target=srv_fast.serve_forever, daemon=True).start()
+    main_port = srv.server_port
+    hybrid.LLAMACPP_URL_FAST = f"http://127.0.0.1:{srv_fast.server_port}/completion"
+    saved_fast = hybrid.LOCAL_MODEL_FAST
+    hybrid.LOCAL_MODEL_FAST = "tiny-fake-3b"
+
+    hybrid.ollama("vote prompt\nQuestion: capital of France?", model="tiny-fake-3b")
+    check("a LOCAL_MODEL_FAST call routes to the fast server",
+          REQUESTS[-1]["_port"] == srv_fast.server_port, REQUESTS[-1]["_port"])
+    hybrid.ollama(hybrid.SETUP_PROMPT.format(q="2 plus 2?"), grammar=hybrid.GRAMMAR_SETUP)
+    check("a transcription call (no model arg) stays on the primary server",
+          REQUESTS[-1]["_port"] == main_port, REQUESTS[-1]["_port"])
+    hybrid.LLAMACPP_URL_FAST = ""
+    hybrid.ollama("vote prompt\nQuestion: capital of France?", model="tiny-fake-3b")
+    check("without LLAMACPP_URL_FAST every call stays on the primary",
+          REQUESTS[-1]["_port"] == main_port, REQUESTS[-1]["_port"])
+    hybrid.LOCAL_MODEL_FAST = saved_fast
+    srv_fast.shutdown()
 
     # --- grammar sanity pins -------------------------------------------------
     for name, g in (("setup", hybrid.GRAMMAR_SETUP), ("fused", hybrid.GRAMMAR_FUSED)):
