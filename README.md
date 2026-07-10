@@ -182,7 +182,7 @@ python test_solver.py                          # solver tests (53/53, no model n
 python test_templates.py                       # template transcriber tests (58/58, no model needed)
 python test_verify.py                          # verifier tests (28/28, no model needed)
 python test_equations.py                       # setup re-derivation tests (45/45, no model needed)
-python test_route.py                           # router plumbing + failure policy + fused table (30/30, no model needed)
+python test_route.py                           # router plumbing + failure policy + fused + load-shed (39/39, no model needed)
 python test_server.py                          # server surface: SSE, auth, limits, cache (22/22, no model needed)
 python bench_router.py                         # full-router benchmark: on-box %, safety, catches
 python measure_routing.py                      # router economics: $ saved vs all-frontier (needs FRONTIER_API_KEY)
@@ -192,7 +192,7 @@ python server.py                               # OpenAI-compatible server on :80
 ```
 
 The oracle tiers and both harnesses (router + server tests) need **nothing** — no model,
-no network — so all 280 tests run anywhere, including CI.
+no network — so all 293 tests run anywhere, including CI.
 
 ### The llama.cpp transport — the GPU-less fast path
 
@@ -333,6 +333,33 @@ silently-substituted local answer. `HYBRID_ON_FRONTIER_FAIL=local` opts into
 availability-over-correctness: a plain local answer labelled `DEGRADED`, *including* for
 queries whose local answer the verifier just refuted — opt in knowingly. Either way a
 failure is a structured result (`route: ERROR`), never an answer-shaped string.
+
+### Load shedding — the production tier
+
+On a CPU box the model tiers cost seconds, and decode is memory-bandwidth-bound, so
+**two model requests at once don't run twice as fast — they queue on the same memory
+bus.** Making the second caller wait 40 seconds is worse than escalating them. So under
+load, hybrid sheds the expensive local work to the frontier instead of queueing it. Both
+signals are **off by default** (behavior unchanged), and the deterministic tiers
+(`solve`/`template`) *never* shed — they cost nothing and answer regardless:
+
+- **`HYBRID_MODEL_MAX_INFLIGHT=N`** — run at most `N` model-tier requests at once; past
+  the cap, escalate immediately. `N=1` is the honest setting for a one-box CPU deploy:
+  serve one model query locally, send the rest to the frontier. A shared, thread-safe
+  in-flight gauge (exposed as `model_inflight` on `/health`) is the capacity signal — a
+  concurrent request checks it and sheds *before* it can queue.
+- **`HYBRID_LATENCY_BUDGET_MS=ms`** — a per-request wall-clock budget. If the time
+  already spent plus the estimated cost of a model tier (`HYBRID_MODEL_TIER_MS`, default
+  8000, scaled by how many calls are queued ahead) would blow it, shed. This turns "the
+  box is slow" into "the box answers what it can inside your SLA and escalates the rest."
+
+A shed is an ordinary escalation — it carries the whole conversation, obeys the frontier
+failure policy, and logs its reason (`route: ESCALATE`, `why: "load shed: 1 model call(s)
+in flight, cap 1 -> frontier"`). Measured live on the 2013 box with `MAX_INFLIGHT=1`: two
+concurrent model-path queries — the first re-derived its answer on the 7B locally, the
+second, arriving while that slot was held, went straight to the frontier instead of
+waiting behind it. That is the difference between a demo and something you can put real
+concurrent traffic through.
 
 ## The honest part (what this taught me)
 
