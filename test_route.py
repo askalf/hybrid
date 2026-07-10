@@ -20,9 +20,22 @@ them, which otherwise only gets exercised with a live model. Both backends are f
     python test_route.py
 """
 import os
+from contextlib import contextmanager
 import hybrid
 
 _REAL_OLLAMA, _REAL_ESCALATE = hybrid.ollama, hybrid.escalate
+
+
+@contextmanager
+def envset(**kv):
+    """Temporarily set env vars, restoring prior values (or unsetting) on exit."""
+    saved = {k: os.environ.get(k) for k in kv}
+    os.environ.update(kv)
+    try:
+        yield
+    finally:
+        for k, v in saved.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
 
 FAILS = []
 COUNT = [0]
@@ -291,6 +304,77 @@ def main():
           fm.kinds[:2] == ["setup", "verify"], ",".join(fm.kinds))
     check("two-call setup carries the setup grammar",
           fm.grammars and fm.grammars[0] == hybrid.GRAMMAR_SETUP, str(fm.grammars[0])[:40])
+
+    # --- 7. load shedding (concurrency cap + latency budget) -------------------
+    import threading
+
+    # the gate primitive, unit-tested directly (no slot left dangling on shed)
+    assert hybrid.model_inflight() == 0
+    with envset(HYBRID_MODEL_MAX_INFLIGHT="0"):
+        r0 = hybrid._enter_model_or_shed(0.0)
+    check("gate off -> takes a slot (returns None)",
+          r0 is None and hybrid.model_inflight() == 1, str(r0))
+    hybrid._leave_model()
+    check("_leave_model releases the slot", hybrid.model_inflight() == 0, "")
+
+    with envset(HYBRID_LATENCY_BUDGET_MS="1000", HYBRID_MODEL_TIER_MS="8000"):
+        r1 = hybrid._enter_model_or_shed(0.0)
+    check("budget: one tier (8s) over a 1s budget -> shed, no slot",
+          isinstance(r1, str) and "latency budget" in r1 and hybrid.model_inflight() == 0, r1)
+
+    with envset(HYBRID_LATENCY_BUDGET_MS="20000", HYBRID_MODEL_TIER_MS="8000"):
+        r2 = hybrid._enter_model_or_shed(0.0)
+    check("budget: one tier under a 20s budget -> proceed", r2 is None, str(r2))
+    hybrid._leave_model()
+
+    # cap: with the gauge already at 1, a cap of 1 sheds; the deterministic tiers
+    # (SOLVED/template) must NEVER shed even when the box is 'full'.
+    hybrid._MODEL_INFLIGHT = 1  # simulate one model request in flight
+    try:
+        with envset(HYBRID_MODEL_MAX_INFLIGHT="1"):
+            fm, ff = FakeModel(), FakeFrontier()
+            r = run("What is 47 times 19?", fm, ff, env={"HYBRID_MODEL_MAX_INFLIGHT": "1"})
+            check("SOLVED never sheds (deterministic, free) even at the cap",
+                  r["route"] == "SOLVED" and ff.calls == 0, r["route"])
+            fm, ff = FakeModel(concise=["x"]), FakeFrontier("frontier")
+            r = run("What is the capital of Japan?", fm, ff, env={"HYBRID_MODEL_MAX_INFLIGHT": "1"})
+            check("a model-path query sheds at the cap -> frontier",
+                  r["route"] == "ESCALATE" and "load shed" in r["why"] and ff.calls == 1
+                  and "concise" not in fm.kinds, r["why"])
+    finally:
+        hybrid._MODEL_INFLIGHT = 0
+
+    # threaded integration: one request genuinely HOLDS a model slot while a second,
+    # concurrent model-path request arrives and sheds — the real server behavior.
+    holding = threading.Event()
+    release = threading.Event()
+
+    class HoldingModel:
+        """Blocks inside the vote's model call until released, holding the slot."""
+        def __call__(self, prompt, num_predict=256, temperature=0.0, model=None, grammar=None):
+            holding.set()
+            release.wait(10)
+            return "held", 0.0
+
+    hybrid.ollama, hybrid.escalate = HoldingModel(), FakeFrontier("frontier")
+    os.environ["HYBRID_MODEL_MAX_INFLIGHT"] = "1"
+    try:
+        t = threading.Thread(target=lambda: hybrid.route("What is the capital of France?"))
+        t.start()
+        got = holding.wait(10)  # wait until the first request is inside its model slot
+        inflight_during = hybrid.model_inflight()
+        r = hybrid.route("What is the capital of Spain?")  # arrives while the slot is held
+        release.set(); t.join(10)
+        check("a slot is held across the in-flight request's model call",
+              got and inflight_during == 1, f"held={got} inflight={inflight_during}")
+        check("concurrent model-path request sheds while the slot is held",
+              r["route"] == "ESCALATE" and "load shed" in r["why"], r["why"])
+        check("the slot is released after the in-flight request finishes",
+              hybrid.model_inflight() == 0, str(hybrid.model_inflight()))
+    finally:
+        release.set()
+        os.environ.pop("HYBRID_MODEL_MAX_INFLIGHT", None)
+        hybrid.ollama, hybrid.escalate = _REAL_OLLAMA, _REAL_ESCALATE
 
     print("-" * 72)
     if FAILS:

@@ -124,7 +124,8 @@ class H(BaseHTTPRequestHandler):
         path = self.path.split("?")[0].rstrip("/")
         if path in ("", "/health"):          # liveness is never behind auth
             return self._json(200, {"status": "ok", "service": "hybrid",
-                                    "version": hybrid.__version__})
+                                    "version": hybrid.__version__,
+                                    "model_inflight": hybrid.model_inflight()})
         if not self._authed():
             return None                      # _authed already sent the 401
         if path.endswith("/models"):

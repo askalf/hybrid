@@ -50,8 +50,27 @@ Failure policy (env) — a dead backend degrades predictably instead of crashing
                            "local" trades correctness for availability — it serves a plain
                            local answer labelled degraded, INCLUDING for queries whose local
                            answer the verifier just caught as wrong. Opt in knowingly.
+
+Load shedding (env) — under load, ESCALATE the expensive local work instead of queueing
+it. Both OFF by default (behavior unchanged); the deterministic tiers (solve/template)
+never shed — they cost nothing and answer regardless.
+  HYBRID_MODEL_MAX_INFLIGHT  0 (off) | N
+                           Run at most N model-tier requests at once. On a memory-
+                           bandwidth-bound CPU a single decode saturates the bus, so the
+                           N+1th request would not run faster — it would queue behind the
+                           others. Past the cap, shed to the frontier now. N=1 is the
+                           honest setting for a one-box CPU deploy: serve one model query
+                           locally, send the rest up.
+  HYBRID_LATENCY_BUDGET_MS   0 (off) | ms
+                           A per-request wall-clock budget. If the time already spent plus
+                           the estimated cost of a model tier (HYBRID_MODEL_TIER_MS, scaled
+                           by how many calls are queued ahead) would exceed it, shed. Turns
+                           "the box is slow" into "the box answers what it can inside your
+                           SLA and escalates the rest".
+  HYBRID_MODEL_TIER_MS       8000 — the estimated wall cost of one model tier, for the
+                           budget projection. Set it to your box's measured p50.
 """
-import sys, os, time, json, re, urllib.request
+import sys, os, time, json, re, threading, urllib.request
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from solver import solve
@@ -59,7 +78,7 @@ import equations
 import templates
 import verify
 
-__version__ = "1.7.0"
+__version__ = "1.8.0"
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # Windows cp1252 chokes on non-ASCII
@@ -365,6 +384,60 @@ def local_consistency(query, k=3):
     return (n >= k), best, f"{n}/{k}", t  # unanimous: escalate unless the model fully agrees with itself
 
 
+# ── Load shedding ──────────────────────────────────────────────────────────
+# One shared gauge of model-tier requests currently executing. It is the load
+# signal the shed gate reads, and it is shared across threads on purpose: a
+# server (server.py) handles requests on threads, and on a bandwidth-bound box
+# every one of them contends for the same memory bus, so "how many model calls
+# are running right now" is the real capacity number — not CPU %, not a queue.
+_MODEL_LOCK = threading.Lock()
+_MODEL_INFLIGHT = 0
+
+
+def _int_env(name):
+    """Env var as a non-negative int; malformed or unset -> 0 (the 'off' value)."""
+    try:
+        return max(0, int(os.environ.get(name, "0") or 0))
+    except ValueError:
+        return 0
+
+
+def model_inflight():
+    """Model-tier requests currently executing (for /health, dashboards, tests)."""
+    with _MODEL_LOCK:
+        return _MODEL_INFLIGHT
+
+
+def _enter_model_or_shed(elapsed_s):
+    """Decide — atomically — whether to run model-tier work locally or shed it to
+    the frontier. Returns a shed-reason string (NO slot taken), or None meaning a
+    slot was taken and the caller MUST call _leave_model() when the model work ends.
+    Check-and-take under one lock so two arrivals can't both slip past a cap of 1."""
+    global _MODEL_INFLIGHT
+    cap = _int_env("HYBRID_MODEL_MAX_INFLIGHT")
+    budget_ms = _int_env("HYBRID_LATENCY_BUDGET_MS")
+    with _MODEL_LOCK:
+        inflight = _MODEL_INFLIGHT
+        if cap and inflight >= cap:
+            return f"load shed: {inflight} model call(s) in flight, cap {cap} -> frontier"
+        if budget_ms:
+            tier_ms = _int_env("HYBRID_MODEL_TIER_MS") or 8000
+            # a new call waits behind the ones already running (bandwidth-bound, so
+            # roughly additive), then costs one tier itself.
+            projected = elapsed_s * 1000 + tier_ms * (inflight + 1)
+            if projected > budget_ms:
+                return (f"latency budget: ~{int(projected)}ms projected "
+                        f"({inflight} ahead) > {budget_ms}ms -> frontier")
+        _MODEL_INFLIGHT += 1  # slot taken; caller owns the matching _leave_model()
+        return None
+
+
+def _leave_model():
+    global _MODEL_INFLIGHT
+    with _MODEL_LOCK:
+        _MODEL_INFLIGHT = max(0, _MODEL_INFLIGHT - 1)
+
+
 def route(query, messages=None):
     """Route one query. `messages` (optional) is the full OpenAI-style conversation:
     routing decisions and the LOCAL tiers always work on `query` — the last user
@@ -398,6 +471,7 @@ def route(query, messages=None):
 
 
 def _route(query, messages=None):
+    t0 = time.time()
     # 0. exact oracle — closed-form arithmetic / conversions / %-change, free + correct.
     exact = solve(query)
     if exact is not None:
@@ -414,11 +488,32 @@ def _route(query, messages=None):
         return {"route": "SOLVED", "why": f"template: {shape}",
                 "backend": "python (exact)", "answer": val,
                 "router_s": 0.0, "answer_s": 0.0}
-    # 1. known-hard categories -> escalate by rule.
+    # 1. known-hard categories -> escalate by rule. No model call, so it is never
+    #    gated or slotted — a hard query already goes to the frontier.
     if _HARD.search(query) or len(query) > 220:
         ans, dt = _escalate(query, messages)
         return {"route": "ESCALATE", "why": "rule: hard category", "backend": FRONTIER_MODEL,
                 "answer": ans, "router_s": 0.0, "answer_s": round(dt, 2)}
+    # --- LOAD-SHED GATE --------------------------------------------------------
+    # Everything past here does model-tier work. If the box is over its concurrency
+    # cap or the request's latency budget, escalate NOW instead of queueing a slow
+    # local call (both signals off by default -> no gating). On "proceed", a model
+    # slot is held for the whole model portion via the try/finally below.
+    shed = _enter_model_or_shed(time.time() - t0)
+    if shed:
+        ans, dt = _escalate(query, messages)
+        return {"route": "ESCALATE", "why": shed, "backend": FRONTIER_MODEL,
+                "answer": ans, "router_s": 0.0, "answer_s": round(dt, 2)}
+    try:
+        return _route_model(query, messages)
+    finally:
+        _leave_model()
+
+
+def _route_model(query, messages=None):
+    """The model-tier portion of the route, run while a model slot is held. Every
+    path here makes at least one local model call: _OPEN creative, the quantitative
+    oracle tiers (derive/plug-back, or _route_two_call), then the vote."""
     # 2. open-ended / creative -> keep local (no single right answer, fast model fine).
     if _OPEN.search(query):
         ans, dt = ollama(CONCISE.format(q=query), num_predict=200, model=LOCAL_MODEL_FAST)

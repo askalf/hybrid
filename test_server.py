@@ -86,6 +86,8 @@ def main():
     code, body, _ = call("/health")
     check("/health is live and reports the version",
           code == 200 and body.get("version") == hybrid.__version__, body)
+    check("/health reports the model-inflight gauge for ops",
+          body.get("model_inflight") == 0, body)
 
     code, body, _ = call("/v1/models")
     check("/v1/models lists model 'hybrid'",

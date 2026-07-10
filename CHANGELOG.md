@@ -3,6 +3,34 @@
 All notable changes to hybrid are documented here. This project adheres to
 [Semantic Versioning](https://semver.org).
 
+## v1.8.0 — 2026-07-10
+
+**Load shedding — the tier that makes "production" honest.** On a CPU box the model
+tiers cost seconds and decode is memory-bandwidth-bound, so concurrent model requests
+queue on the same bus rather than parallelizing. Under load, hybrid now escalates the
+expensive local work to the frontier instead of making a caller wait. Both signals are
+**off by default** (behavior unchanged); the deterministic tiers never shed.
+
+- **`HYBRID_MODEL_MAX_INFLIGHT=N`** — run at most N model-tier requests at once; beyond
+  the cap, shed to the frontier. Backed by a shared, thread-safe in-flight gauge, taken
+  atomically at a gate placed after the free tiers and before any model call, and held
+  for the whole model portion via `try/finally`. `N=1` is the honest one-box CPU
+  setting. Exposed as `model_inflight` on `/health`.
+- **`HYBRID_LATENCY_BUDGET_MS=ms`** (+ `HYBRID_MODEL_TIER_MS`, default 8000) — a
+  per-request wall-clock budget; if elapsed + projected model cost (scaled by queue
+  depth ahead) would exceed it, shed. "Answer what fits your SLA, escalate the rest."
+- A shed is an ordinary escalation: carries the conversation, obeys the frontier failure
+  policy, logs `route: ESCALATE, why: "load shed: …"`.
+- **Measured live** on the 2013 box with `MAX_INFLIGHT=1`: two concurrent model-path
+  queries — the first re-derived locally on the 7B, the second (arriving while that slot
+  was held) shed straight to the frontier instead of queueing behind it.
+- Tests: `test_route.py` grows to 39 with the gate unit tests, a cap/deterministic-tier
+  matrix, and a **threaded** integration test that genuinely holds a slot open while a
+  concurrent request sheds. `/health` gauge pinned in `test_server.py`. Suite total 293.
+- Refactor: the model-tier portion of `_route` is extracted to `_route_model` so the
+  slot brackets it cleanly — behavior byte-identical with shedding off (full suite green
+  before any new test was added).
+
 ## v1.7.0 — 2026-07-10
 
 The GPU-less fast path: a native **llama.cpp transport** for the local tier
