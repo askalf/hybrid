@@ -78,7 +78,7 @@ import equations
 import templates
 import verify
 
-__version__ = "1.9.0"
+__version__ = "1.10.0"
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # Windows cp1252 chokes on non-ASCII
@@ -711,9 +711,92 @@ def _render_prompt(system, messages):
     return "\n".join(parts) + "\nQuestion: (respond to the last User turn following the instructions above)"
 
 
-def route_messages(system, messages, max_tokens=512):
-    """Route an Anthropic-style request. Two modes, chosen by whether a system
-    instruction is present:
+def _clean_labels(labels):
+    """A request's declared label set (metadata.hybrid_labels) -> a clean list of
+    distinct non-empty single-line strings, capped. Anything malformed -> [] (the
+    request just isn't treated as a labelled classification)."""
+    if not isinstance(labels, (list, tuple)):
+        return []
+    out = []
+    for l in labels:
+        if isinstance(l, str):
+            l = l.strip()
+            if l and "\n" not in l and len(l) <= 64 and l not in out:
+                out.append(l)
+    return out[:32]
+
+
+def _labels_grammar(labels):
+    """GBNF forcing the local model to emit EXACTLY one of the labels (llamacpp
+    transport only — the Ollama generate API ignores it, and we extract the label
+    instead). Returns None if a label isn't safe for a GBNF string literal, so a
+    weird label degrades to unconstrained-sample-then-extract rather than a broken
+    grammar (which llama-server would silently ignore anyway)."""
+    if any('"' in l or "\\" in l for l in labels):
+        return None
+    return "root ::= " + " | ".join(f'"{l}"' for l in labels) + "\n"
+
+
+def _extract_label(text, labels):
+    """The first declared label appearing as a whole word in `text` (case-
+    insensitive), or None — so a rambly 'The category is build.' still yields
+    'build', and 'I am not sure' yields None (-> escalate)."""
+    low = text.lower()
+    best = None
+    for l in labels:
+        m = re.search(r"\b" + re.escape(l.lower()) + r"\b", low)
+        if m and (best is None or m.start() < best[0]):
+            best = (m.start(), l)
+    return best[1] if best else None
+
+
+def _route_messages_labeled(system, messages, user_text, oai, labels):
+    """Labelled classification — the 'constrain and verify' answer to 'vote and
+    hope'. The local model is grammar-constrained to emit ONE of the caller's
+    labels (llamacpp) and sampled k times; each sample is normalized to the label
+    it contains (so generative preamble can't break unanimity). A unanimous, valid
+    label is served on-box — guaranteed to be one the caller declared. Anything
+    else — disagreement, or a sample with no valid label — escalates. So a served
+    label is both self-consistent AND provably in-set; hybrid's verifier discipline,
+    applied to classification."""
+    shed = _enter_model_or_shed(0.0)
+    if shed:
+        ans, dt = _escalate(user_text, oai)
+        return {"route": "ESCALATE", "why": shed, "backend": FRONTIER_MODEL,
+                "answer": ans, "router_s": 0.0, "answer_s": round(dt, 2)}
+    try:
+        k = 2 if os.environ.get("HYBRID_VOTE_FAST", "") == "1" else 3
+        grammar = _labels_grammar(labels)
+        prompt = _render_prompt(system, messages)
+        t0 = time.time()
+        with ThreadPoolExecutor(max_workers=k) as ex:
+            futures = [ex.submit(ollama, prompt, 16, 0.6, LOCAL_MODEL_FAST, grammar)
+                       for _ in range(k)]
+            picks = [_extract_label(f.result()[0], labels) for f in futures]
+        ct = time.time() - t0
+    finally:
+        _leave_model()
+    if picks[0] is not None and all(p == picks[0] for p in picks):
+        return {"route": "LOCAL", "why": f"label self-consistent {k}/{k} of {len(labels)}",
+                "backend": LOCAL_MODEL_FAST, "answer": picks[0],
+                "router_s": round(ct, 2), "answer_s": 0.0}
+    why = "label uncertain (self-inconsistent)" if None not in picks else "no valid label on-box"
+    ans, dt = _escalate(user_text, oai)
+    return {"route": "ESCALATE", "why": why, "backend": FRONTIER_MODEL,
+            "answer": ans, "router_s": round(ct, 2), "answer_s": round(dt, 2)}
+
+
+def route_messages(system, messages, max_tokens=512, labels=None):
+    """Route an Anthropic-style request. Three modes:
+
+      - LABELLED (metadata.hybrid_labels declares an allowed label set): a
+        constrained-and-verified classification — grammar-lock the local model to
+        the labels, vote on the extracted label, serve a unanimous in-set label or
+        escalate (see _route_messages_labeled). The reliable path for classifiers.
+
+    ...and, when no labels are declared:
+
+    Two modes, chosen by whether a system instruction is present:
 
       - NO system instruction: the last user turn is a self-contained question, so
         run the full router (solve / template / verify / vote / escalate) — the
@@ -728,6 +811,12 @@ def route_messages(system, messages, max_tokens=512):
     Same dict shape and failure policy as route()."""
     user_text = _anthropic_user_text(messages)
     oai = _anthropic_to_openai(system, messages)
+    labels = _clean_labels(labels)
+    if labels:
+        try:
+            return _route_messages_labeled(system, messages, user_text, oai, labels)
+        except BackendError as e:
+            return _apply_failure_policy(e, user_text, oai)
     if not (system and str(system).strip()):
         return route(user_text, oai)
     try:

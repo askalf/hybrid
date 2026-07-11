@@ -3,6 +3,31 @@
 All notable changes to hybrid are documented here. This project adheres to
 [Semantic Versioning](https://semver.org).
 
+## v1.10.0 — 2026-07-10
+
+**Labelled classification on the Anthropic endpoint — constrain and verify, not vote
+and hope.** Most cheap Anthropic calls are classification (pick one of these labels).
+The plain instruction vote handles it, but votes on raw text — a rambly local answer
+breaks unanimity and nothing stops the model inventing an out-of-set label.
+
+- A request declares its label set via `metadata.hybrid_labels: ["build", "research",
+  ...]` (a custom key real Anthropic ignores). hybrid then GRAMMAR-LOCKS the local model
+  to emit exactly one of those labels (GBNF, on the llama.cpp transport), samples it k
+  times, and normalizes each sample to the label it contains before voting. A served
+  answer is both self-consistent AND provably in-set; disagreement, or a sample with no
+  in-set label, escalates. The verifier discipline — constrain the output, verify it is
+  valid — applied to labels instead of arithmetic.
+- **Measured live**, grammar-locked, on a real 3B over `build`/`research`/`monitor`/
+  `security`: four dispatcher-style requests each classified on-box, unanimous, and
+  guaranteed in-set — the model cannot return a category you did not ask for.
+- New helpers: `_clean_labels`, `_labels_grammar` (returns None on an unsafe label →
+  degrade to unconstrained-sample-then-extract, never a broken grammar), `_extract_label`
+  (whole-word, tolerates preamble). A malformed `hybrid_labels` payload falls back to the
+  plain instruction-following path.
+- `test_messages.py` grows to 32 with the label unit tests, the routing table
+  (unanimous / split / no-label / malformed), and the end-to-end `metadata` path. Suite
+  total 325.
+
 ## v1.9.0 — 2026-07-10
 
 **An Anthropic `/v1/messages` front door** — so the Anthropic-shaped callers a fleet
