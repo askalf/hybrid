@@ -28,7 +28,7 @@ def check(name, cond, detail=""):
 
 REQUESTS = []
 GETS = []
-BEHAVIOR = {"fail_times": 0, "n_slots": 3, "content": " 42 "}
+BEHAVIOR = {"fail_times": 0, "n_slots": 3, "content": " 42 ", "top_logprobs": None}
 
 
 class FakeLlamaServer(BaseHTTPRequestHandler):
@@ -42,8 +42,12 @@ class FakeLlamaServer(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b"boom")
             return
-        out = json.dumps({"content": BEHAVIOR["content"],
-                          "timings": {"prompt_n": 1}}).encode()
+        payload = {"content": BEHAVIOR["content"], "timings": {"prompt_n": 1}}
+        if BEHAVIOR["top_logprobs"] is not None:
+            payload["completion_probabilities"] = [
+                {"token": BEHAVIOR["content"].strip(), "logprob": -0.1,
+                 "top_logprobs": BEHAVIOR["top_logprobs"]}]
+        out = json.dumps(payload).encode()
         self.send_response(200)
         self.send_header("content-type", "application/json")
         self.end_headers()
@@ -178,17 +182,82 @@ def main():
     BEHAVIOR["n_slots"] = 3
 
     # the labelled-classification vote: all k samples ride the SAME pinned slot
+    # (no top_logprobs configured -> the logit path returns None -> vote fallback)
     BEHAVIOR["content"] = " build "
+    n0 = len(REQUESTS)
     res = hybrid._route_messages_labeled(
         "Classify into exactly one category.",
         [{"role": "user", "content": "set up CI for my repo"}],
         "set up CI for my repo", None, ["build", "research"])
+    check("no top_logprobs -> logit read degrades to the sampling vote",
+          len(REQUESTS) - n0 == 4, len(REQUESTS) - n0)  # 1 logit probe + 3 vote samples
     slots = [r.get("id_slot") for r in REQUESTS[-3:]]
     check("labelled vote: 3/3 samples pinned to one family slot",
           slots[0] is not None and len(set(slots)) == 1, slots)
     check("labelled vote still serves the grammar-locked label",
           res["route"] == "LOCAL" and res["answer"] == "build",
           f"{res['route']}/{res['answer']}")
+    BEHAVIOR["content"] = " 42 "
+
+    # --- logit-read classification (read the posterior, don't sample it) -----
+    import math
+    LB = ["research", "monitor", "build", "analyze", "automate", "security"]
+
+    m = hybrid._label_posterior(
+        [{"token": "build", "logprob": math.log(0.7)},
+         {"token": " build", "logprob": math.log(0.05)},   # space variant, same label
+         {"token": "autom", "logprob": math.log(0.1)},     # BPE split -> automate
+         {"token": "analy", "logprob": math.log(0.05)},    # BPE split -> analyze
+         {"token": "a", "logprob": math.log(0.05)},        # ambiguous -> skipped
+         {"token": "zzz", "logprob": math.log(0.05)}],     # no label -> skipped
+        LB)
+    check("posterior: space/BPE variants sum onto their label",
+          abs(m.get("build", 0) - 0.75) < 1e-9 and abs(m.get("automate", 0) - 0.1) < 1e-9,
+          {k: round(v, 3) for k, v in m.items()})
+    check("posterior: ambiguous prefixes are skipped, not guessed",
+          "analyze" in m and len(m) == 3, sorted(m))
+
+    BEHAVIOR["top_logprobs"] = [{"token": "build", "logprob": math.log(0.8)},
+                                {"token": "research", "logprob": math.log(0.1)}]
+    BEHAVIOR["content"] = "build"
+    n0 = len(REQUESTS)
+    res = hybrid._route_messages_labeled(
+        "Classify into exactly one category.",
+        [{"role": "user", "content": "set up CI for my repo"}],
+        "set up CI for my repo", None, LB)
+    check("hard posterior serves LOCAL in ONE forward pass (not three)",
+          res["route"] == "LOCAL" and res["answer"] == "build" and len(REQUESTS) - n0 == 1,
+          f"{res['route']}/{res['answer']}/{len(REQUESTS) - n0} req")
+    check("the why-string carries both probabilities (calibration data)",
+          "posterior" in res["why"] and "0.80" in res["why"], res["why"])
+    check("the logit probe asked for n_probs and 1 token",
+          REQUESTS[-1].get("n_probs") == 25 and REQUESTS[-1].get("n_predict") == 1,
+          {k: REQUESTS[-1].get(k) for k in ("n_probs", "n_predict")})
+
+    saved_esc = hybrid.escalate
+    hybrid.escalate = lambda q, messages=None: ("frontier-label", 0.0)
+    BEHAVIOR["top_logprobs"] = [{"token": "build", "logprob": math.log(0.35)},
+                                {"token": "research", "logprob": math.log(0.30)}]
+    res = hybrid._route_messages_labeled(
+        "Classify into exactly one category.",
+        [{"role": "user", "content": "handle the thing"}],
+        "handle the thing", None, LB)
+    check("soft posterior escalates with the margin in the why",
+          res["route"] == "ESCALATE" and "soft" in res["why"] and "0.35" in res["why"],
+          res["why"])
+    hybrid.escalate = saved_esc
+
+    os.environ["HYBRID_LABEL_LOGITS"] = "0"
+    BEHAVIOR["content"] = " build "
+    n0 = len(REQUESTS)
+    res = hybrid._route_messages_labeled(
+        "Classify into exactly one category.",
+        [{"role": "user", "content": "set up CI for my repo"}],
+        "set up CI for my repo", None, ["build", "research"])
+    check("HYBRID_LABEL_LOGITS=0 is the escape hatch (vote only, no probe)",
+          res["route"] == "LOCAL" and len(REQUESTS) - n0 == 3, len(REQUESTS) - n0)
+    os.environ.pop("HYBRID_LABEL_LOGITS")
+    BEHAVIOR["top_logprobs"] = None
     BEHAVIOR["content"] = " 42 "
 
     # --- grammar sanity pins -------------------------------------------------
