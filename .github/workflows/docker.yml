@@ -1,0 +1,54 @@
+# Build and push the hybrid container image to GHCR, so a deploy can PULL a
+# pinned image instead of building from source (this is how the Own Your Stack
+# platform consumes it — same pattern as dario). Fires on every release, and on
+# manual dispatch so the current version's image can be (re)published without
+# cutting a new release.
+#
+# Consumes: the repo Dockerfile (python:slim + the stdlib modules). No registry
+# secret — the built-in GITHUB_TOKEN authenticates to GHCR via packages:write.
+# Uses plain docker login/build/push (no third-party actions to pin) besides the
+# already-SHA-pinned checkout.
+#
+# After the first push, the package ghcr.io/<owner>/hybrid may be PRIVATE by
+# default — make it public (or grant the puller read) so the box can pull it.
+name: docker
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: derive image + version
+        id: meta
+        run: |
+          ver=$(grep -oE '__version__ = "[^"]+"' hybrid.py | grep -oE '[0-9][^"]*')
+          test -n "$ver" || { echo "could not read hybrid.__version__"; exit 1; }
+          owner=$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
+          # on a release, the tag must match the packaged version (same gate as publish.yml)
+          if [ "${GITHUB_EVENT_NAME}" = "release" ]; then
+            test "v$ver" = "${GITHUB_REF_NAME}" || { echo "tag ${GITHUB_REF_NAME} != v$ver"; exit 1; }
+          fi
+          echo "image=ghcr.io/${owner}/hybrid" >> "$GITHUB_OUTPUT"
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+
+      - name: log in to GHCR
+        run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: build + push
+        run: |
+          img="${{ steps.meta.outputs.image }}"
+          ver="${{ steps.meta.outputs.version }}"
+          docker build -t "$img:$ver" -t "$img:latest" .
+          docker push "$img:$ver"
+          docker push "$img:latest"
+          echo "pushed $img:$ver and $img:latest" >> "$GITHUB_STEP_SUMMARY"
