@@ -3,6 +3,41 @@
 All notable changes to hybrid are documented here. This project adheres to
 [Semantic Versioning](https://semver.org).
 
+## v1.12.0 — 2026-07-11
+
+**Logit-read classification — read the posterior, don't sample it.** The labelled
+vote asked the model the same question k times at temperature 0.6 and checked
+agreement: a noisy, 3-forward-pass approximation of a number the model computes in
+its FIRST forward pass — the probability distribution over the label set. When the
+output space is enumerable, confidence is directly readable.
+
+- On the llamacpp transport, labelled classification now makes ONE call
+  (`n_predict: 1`, `n_probs`) and reads the first-token distribution: token mass is
+  mapped onto labels (BPE splits like `autom`→automate and leading-space variants
+  are summed; a prefix matching several labels is skipped, not guessed), and the
+  argmax is served behind a probability-and-margin gate (`HYBRID_LABEL_MIN_P`,
+  default 0.4; `HYBRID_LABEL_MARGIN`, default 2.0). A soft posterior escalates —
+  after the model slot is released, so a frontier round-trip never holds local
+  capacity.
+- **Measured on a real 0.5B** (same six forge-shaped requests, warm): p50 505 →
+  374 ms, on-box 5/6 → 6/6, and two consecutive logit passes were IDENTICAL —
+  the vote's pass-to-pass swing (temperature sampling) is gone entirely.
+- **The honest finding the read exposes:** the small model's known bias class
+  (two items mislabelled `analyze`) serves at posteriors 0.66/0.69 — inside the
+  range of its CORRECT answers (0.56–0.87). Confidently-wrong is calibrated-
+  looking; no consensus vote and no fixed threshold separates it. What the logit
+  read adds is the NUMBER: every decision now logs `label posterior p1 vs p2`,
+  so escalation thresholds can be tuned per family from real traffic — and the
+  logged (margin, frontier-verdict) pairs are exactly the training signal for a
+  distilled student that kills the bias with data.
+- The sampling vote remains as the automatic fallback: ollama transport, servers
+  without `top_logprobs`, unreadable responses, or `HYBRID_LABEL_LOGITS=0` — any
+  of these degrade to exactly the k-sample behavior.
+- `test_backend.py` fake server gains `top_logprobs`; new pins: posterior mapping
+  (BPE/space variants, ambiguity skip), one-forward-pass serve, soft-margin
+  escalate with probabilities in the why-string, missing-probs and env-off
+  fallbacks. Suite total 342.
+
 ## v1.11.0 — 2026-07-11
 
 **Slot pinning — prompt families keep their prefill.** `cache_prompt` only reuses a

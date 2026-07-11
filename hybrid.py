@@ -79,8 +79,18 @@ votes stay unpinned — they benefit more from batching across slots.
                            0 disables pinning entirely. With 1, pinning still engages
                            only when the server exposes GET /slots (llama-server default;
                            --no-slots turns it off) — otherwise behavior is unchanged.
+
+Logit-read classification (llamacpp transport) — the label set is enumerable, so
+labelled classification reads the model's first-token posterior over it in ONE forward
+pass (n_probs) instead of sampling k times and voting. Deterministic, a third of the
+passes, and the decision log carries the two probabilities (calibration data). The
+sampling vote remains the automatic fallback (ollama transport, no top_logprobs, or
+any malformed response).
+  HYBRID_LABEL_LOGITS        1 (default) | 0 — 0 restores the pure sampling vote
+  HYBRID_LABEL_MIN_P         0.4 — minimum posterior mass on the winner to serve
+  HYBRID_LABEL_MARGIN        2.0 — winner must carry >= this x the runner-up's mass
 """
-import sys, os, time, json, re, threading, urllib.request, hashlib
+import sys, os, time, json, re, threading, urllib.request, hashlib, math
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from solver import solve
@@ -88,7 +98,7 @@ import equations
 import templates
 import verify
 
-__version__ = "1.11.0"
+__version__ = "1.12.0"
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # Windows cp1252 chokes on non-ASCII
@@ -345,21 +355,13 @@ def ollama(prompt, num_predict=256, temperature=0.0, model=None, grammar=None,
     API has no grammar parameter. `family` (llamacpp only) names the request's
     prompt family for slot pinning — see _pin_slot; None (default) pins nothing."""
     if LOCAL_BACKEND == "llamacpp":
-        # the fast-tier calls (they pass model=LOCAL_MODEL_FAST) go to the fast server
-        # when one is configured; transcription calls never do — same pinned policy as
-        # the Ollama transport, enforced by URL instead of model name.
-        fast = (LLAMACPP_URL_FAST and model is not None
-                and model == LOCAL_MODEL_FAST and model != LOCAL_MODEL)
-        url = LLAMACPP_URL_FAST if fast else LLAMACPP_URL
-        body_dict = _llamacpp_body(prompt, num_predict, temperature, grammar)
-        _pin_slot(body_dict, url, family)
-        body = json.dumps(body_dict).encode()
-    else:
-        url = OLLAMA_URL
-        body = json.dumps({
-            "model": model or LOCAL_MODEL, "prompt": prompt, "stream": False, "keep_alive": "5m",
-            "options": {"num_predict": num_predict, "temperature": temperature},
-        }).encode()
+        r, dt = _llamacpp_call(prompt, num_predict, temperature, grammar, model, family)
+        return r.get("content", "").strip(), dt
+    url = OLLAMA_URL
+    body = json.dumps({
+        "model": model or LOCAL_MODEL, "prompt": prompt, "stream": False, "keep_alive": "5m",
+        "options": {"num_predict": num_predict, "temperature": temperature},
+    }).encode()
     t0 = time.time()
     last = None
     for attempt in (1, 2):
@@ -367,8 +369,39 @@ def ollama(prompt, num_predict=256, temperature=0.0, model=None, grammar=None,
             req = urllib.request.Request(url, data=body,
                                          headers={"content-type": "application/json"})
             r = json.loads(urllib.request.urlopen(req, timeout=300).read())
-            text = r.get("content", "") if LOCAL_BACKEND == "llamacpp" else r.get("response", "")
-            return text.strip(), time.time() - t0
+            return r.get("response", "").strip(), time.time() - t0
+        except Exception as e:
+            last = e
+            if attempt == 1:
+                time.sleep(1.0)
+    raise BackendError("local", f"{model or LOCAL_MODEL} at {url}: {last}")
+
+
+def _llamacpp_call(prompt, num_predict, temperature, grammar, model, family, extra=None):
+    """One llama-server /completion round-trip, returning the PARSED RESPONSE dict
+    (not just the text) plus elapsed seconds — so callers that need more than
+    `content` (the label-posterior read wants completion_probabilities) share the
+    same URL routing, slot pinning, and retry/BackendError contract as ollama().
+    `extra` merges additional request fields (e.g. n_probs)."""
+    # the fast-tier calls (they pass model=LOCAL_MODEL_FAST) go to the fast server
+    # when one is configured; transcription calls never do — same pinned policy as
+    # the Ollama transport, enforced by URL instead of model name.
+    fast = (LLAMACPP_URL_FAST and model is not None
+            and model == LOCAL_MODEL_FAST and model != LOCAL_MODEL)
+    url = LLAMACPP_URL_FAST if fast else LLAMACPP_URL
+    body_dict = _llamacpp_body(prompt, num_predict, temperature, grammar)
+    if extra:
+        body_dict.update(extra)
+    _pin_slot(body_dict, url, family)
+    body = json.dumps(body_dict).encode()
+    t0 = time.time()
+    last = None
+    for attempt in (1, 2):
+        try:
+            req = urllib.request.Request(url, data=body,
+                                         headers={"content-type": "application/json"})
+            return (json.loads(urllib.request.urlopen(req, timeout=300).read()),
+                    time.time() - t0)
         except Exception as e:
             last = e
             if attempt == 1:
@@ -809,6 +842,65 @@ def _extract_label(text, labels):
     return best[1] if best else None
 
 
+def _label_posterior(entries, labels):
+    """Map a first-token top_logprobs list onto the label set and return
+    {label: probability mass}. An entry counts toward a label when its token
+    (stripped, case-folded) is a non-empty prefix of EXACTLY ONE label — that
+    absorbs BPE splits ('autom' -> automate, 'analy' -> analyze) and the
+    leading-space variants, while an ambiguous prefix ('a' matches several)
+    is skipped outright rather than guessed."""
+    mass = {}
+    for e in entries or []:
+        tok = str(e.get("token", "")).strip().lower()
+        lp = e.get("logprob")
+        if not tok or lp is None:
+            continue
+        hits = [l for l in labels if l.lower().startswith(tok)]
+        if len(hits) == 1:
+            mass[hits[0]] = mass.get(hits[0], 0.0) + math.exp(lp)
+    return mass
+
+
+def _route_messages_labeled_logits(labels, grammar, fam, prompt):
+    """Read the classifier's answer off the model's OWN first-token distribution —
+    one forward pass — instead of sampling it k times and voting. The label set is
+    enumerable, so the posterior over it is directly readable (n_probs); serving
+    the argmax behind a probability-and-margin gate is strictly more information
+    than 'k samples at temperature 0.6 agreed', at a third of the forward passes
+    and with no sampling noise. The why-string carries the two probabilities, so
+    the decision log accumulates calibration data (local margin vs the frontier's
+    later verdict) for tuning the gate per family.
+
+    Returns a LOCAL result dict; or a soft-posterior marker {p1, p2, router_s}
+    (the caller escalates AFTER releasing the model slot — a frontier round-trip
+    must not hold local capacity); or None to fall back to the sampling vote —
+    on ANY problem (old server without top_logprobs, malformed response, no
+    readable mass): the vote is the safety net, never an exception."""
+    try:
+        r, dt = _llamacpp_call(prompt, 1, 0.0, grammar, LOCAL_MODEL_FAST, fam,
+                               extra={"n_probs": 25})
+        cp = r.get("completion_probabilities") or []
+        entries = (cp[0] or {}).get("top_logprobs") if cp else None
+        mass = _label_posterior(entries, labels)
+        if not mass:
+            return None
+        ranked = sorted(mass.items(), key=lambda kv: -kv[1])
+        best, p1 = ranked[0]
+        p2 = ranked[1][1] if len(ranked) > 1 else 0.0
+        min_p = float(os.environ.get("HYBRID_LABEL_MIN_P", "0.4"))
+        margin = float(os.environ.get("HYBRID_LABEL_MARGIN", "2.0"))
+        if p1 >= min_p and (p2 == 0.0 or p1 >= margin * p2):
+            return {"route": "LOCAL",
+                    "why": f"label posterior {p1:.2f} vs {p2:.2f} of {len(labels)}",
+                    "backend": LOCAL_MODEL_FAST, "answer": best,
+                    "router_s": round(dt, 2), "answer_s": 0.0}
+        return {"p1": p1, "p2": p2, "router_s": round(dt, 2)}
+    except BackendError:
+        raise  # a dead backend is the failure policy's business, same as the vote
+    except Exception:
+        return None  # anything unexpected -> the sampling vote takes over
+
+
 def _route_messages_labeled(system, messages, user_text, oai, labels):
     """Labelled classification — the 'constrain and verify' answer to 'vote and
     hope'. The local model is grammar-constrained to emit ONE of the caller's
@@ -823,26 +915,39 @@ def _route_messages_labeled(system, messages, user_text, oai, labels):
         ans, dt = _escalate(user_text, oai)
         return {"route": "ESCALATE", "why": shed, "backend": FRONTIER_MODEL,
                 "answer": ans, "router_s": 0.0, "answer_s": round(dt, 2)}
+    soft = None
+    picks = ct = None
     try:
-        k = 2 if os.environ.get("HYBRID_VOTE_FAST", "") == "1" else 3
         grammar = _labels_grammar(labels)
         prompt = _render_prompt(system, messages)
         # One classifier = one family: same system prompt + same label set. Pinning
-        # the k samples to that family's slot means sample 1 prefills the prompt and
-        # samples 2..k reuse it whole (identical prompt, decode-only) — instead of k
-        # slots each prefilling from scratch. The prefix then stays hot in that slot
-        # for the classifier's NEXT request. Decode is 1-4 grammar-locked tokens, so
-        # the serialization this causes costs far less than the prefills it saves.
+        # to that family's slot keeps the prompt's prefill hot across requests (and
+        # across the vote's samples, when the vote runs). See _pin_slot.
         fam = "labels\x1f" + str(system or "") + "\x1f" + "\x1f".join(labels)
-        t0 = time.time()
-        with ThreadPoolExecutor(max_workers=k) as ex:
-            futures = [ex.submit(ollama, prompt, 16, 0.6, LOCAL_MODEL_FAST, grammar,
-                                 fam)
-                       for _ in range(k)]
-            picks = [_extract_label(f.result()[0], labels) for f in futures]
-        ct = time.time() - t0
+        # First choice: read the posterior (one forward pass). Falls back to the
+        # k-sample vote when the transport/server can't report it.
+        if LOCAL_BACKEND == "llamacpp" and os.environ.get("HYBRID_LABEL_LOGITS", "1") != "0":
+            res = _route_messages_labeled_logits(labels, grammar, fam, prompt)
+            if res is not None and res.get("route") == "LOCAL":
+                return res
+            soft = res  # soft marker (escalate below, slot released) or None (vote)
+        if soft is None:
+            k = 2 if os.environ.get("HYBRID_VOTE_FAST", "") == "1" else 3
+            t0 = time.time()
+            with ThreadPoolExecutor(max_workers=k) as ex:
+                futures = [ex.submit(ollama, prompt, 16, 0.6, LOCAL_MODEL_FAST,
+                                     grammar, fam)
+                           for _ in range(k)]
+                picks = [_extract_label(f.result()[0], labels) for f in futures]
+            ct = time.time() - t0
     finally:
         _leave_model()
+    if soft is not None:
+        ans, dt = _escalate(user_text, oai)
+        return {"route": "ESCALATE",
+                "why": f"label posterior soft ({soft['p1']:.2f} vs {soft['p2']:.2f})",
+                "backend": FRONTIER_MODEL, "answer": ans,
+                "router_s": soft["router_s"], "answer_s": round(dt, 2)}
     if picks[0] is not None and all(p == picks[0] for p in picks):
         return {"route": "LOCAL", "why": f"label self-consistent {k}/{k} of {len(labels)}",
                 "backend": LOCAL_MODEL_FAST, "answer": picks[0],

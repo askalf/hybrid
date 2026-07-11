@@ -347,6 +347,21 @@ Measured live, grammar-locked, on a real 3B over `["build","research","monitor",
 `research` — every one on-box, unanimous, and guaranteed in-set. The model **cannot**
 return a category you didn't ask for.
 
+**Read the posterior, don't sample it.** On the llama.cpp transport the vote itself is
+now the fallback: the label set is enumerable, so hybrid reads the model's OWN
+first-token probability distribution over it (one forward pass, `n_probs`) and serves
+the argmax behind a probability-and-margin gate — `HYBRID_LABEL_MIN_P` (default 0.4)
+and `HYBRID_LABEL_MARGIN` (default 2.0); a soft posterior escalates. That is strictly
+more information than "k samples at temperature 0.6 agreed," at a third of the forward
+passes, and it is deterministic — measured on a real 0.5B, two consecutive passes were
+identical, p50 dropped 505→374 ms, and on-box went 5/6→6/6. Every decision logs
+`label posterior p1 vs p2`, so the gate can be tuned per family from real traffic.
+One honest caveat the read *exposes* rather than causes: a small model's bias class
+(mislabeling toward a favorite label) is **calibrated-looking** — wrong at the same
+posterior as right — so no fixed threshold removes it; the logged margins against
+frontier verdicts are exactly the data that a distilled student needs to remove it
+with training instead. `HYBRID_LABEL_LOGITS=0` restores the pure sampling vote.
+
 Capacity honesty: on a CPU box the *model* tiers run **seconds-to-a-minute per query**
 and effectively serially — that's memory bandwidth, not a bug. The solver and template
 tiers answer in ~0 ms regardless, and `LOCAL_MODEL_FAST` roughly halves the vote/creative
@@ -380,6 +395,9 @@ is a hardened systemd unit (`DynamicUser`, `ProtectSystem=strict`) where
 | `HYBRID_CACHE_TTL` | `0` (off) | seconds to serve repeated single-turn queries from memory (~0 ms hits) |
 | `HYBRID_CACHE_MAX` | `512` | answer-cache entry cap, LRU-evicted |
 | `HYBRID_SLOT_PIN` | `1` | llamacpp transport: pin prompt families to a server slot (needs `GET /slots`); `0` disables |
+| `HYBRID_LABEL_LOGITS` | `1` | labelled classification reads the first-token posterior (one pass) instead of voting; `0` = sampling vote |
+| `HYBRID_LABEL_MIN_P` | `0.4` | minimum posterior mass on the winning label to serve locally |
+| `HYBRID_LABEL_MARGIN` | `2.0` | winning label must carry ≥ this × the runner-up's mass |
 
 `FRONTIER_URL` is just an OpenAI-compatible chat endpoint — OpenAI, a local proxy, or your
 own gateway. The key only ever leaves your machine on an *escalated* query.
