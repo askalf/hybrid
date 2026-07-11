@@ -278,7 +278,12 @@ class H(BaseHTTPRequestHandler):
             max_tokens = int(req.get("max_tokens") or 512)
         except (TypeError, ValueError):
             max_tokens = 512
-        r = hybrid.route_messages(system, messages, max_tokens=max_tokens)
+        # metadata.hybrid_labels (a custom key real Anthropic ignores) turns this into a
+        # constrained-and-verified classification — grammar-locked to the labels, voted,
+        # served only as a unanimous in-set label. The reliable path for classifiers.
+        meta = req.get("metadata")
+        labels = meta.get("hybrid_labels") if isinstance(meta, dict) else None
+        r = hybrid.route_messages(system, messages, max_tokens=max_tokens, labels=labels)
 
         xh = {"route": r["route"], "why": r["why"], "backend": r["backend"],
               "latency_s": round(r["router_s"] + r["answer_s"], 2), "usage_estimated": True}

@@ -31,9 +31,11 @@ class Vote:
         self.answers = list(answers or [])
         self.fixed, self.fail = fixed, fail
         self.prompts = []
+        self.grammars = []
 
     def __call__(self, prompt, num_predict=256, temperature=0.0, model=None, grammar=None):
         self.prompts.append(prompt)
+        self.grammars.append(grammar)
         if self.fail:
             raise hybrid.BackendError("local", "down (fake)")
         if self.fixed is not None:
@@ -130,6 +132,54 @@ def main():
     check("local down on the instruction path -> escalate (default policy)",
           r["route"] == "ESCALATE" and f.calls == 1, r["why"])
 
+    # --- 6b. labelled classification (metadata.hybrid_labels) ------------------
+    LABELS = ["build", "research", "monitor", "security"]
+    check("_clean_labels: keeps distinct non-empty strings, drops junk",
+          hybrid._clean_labels(["build", "build", "", "x\ny", 5, "research"]) == ["build", "research"])
+    check("_clean_labels: non-list -> []", hybrid._clean_labels("build") == [])
+    g = hybrid._labels_grammar(LABELS)
+    check("_labels_grammar: GBNF alternation of the labels",
+          g.startswith('root ::= "build" | "research"'), g[:40])
+    check("_labels_grammar: unsafe label -> None (degrade to extract)",
+          hybrid._labels_grammar(['a"b']) is None)
+    check("_extract_label: pulls the label out of a rambly answer",
+          hybrid._extract_label("The category is: Build.", LABELS) == "build")
+    check("_extract_label: no valid label -> None",
+          hybrid._extract_label("I am not sure about this", LABELS) is None)
+
+    # unanimous valid label -> LOCAL, guaranteed in-set
+    v, f = Vote(fixed="build"), Frontier()
+    r = with_fakes(v, f, lambda: hybrid.route_messages(CLASSIFY_SYS, MSG, labels=LABELS))
+    check("labelled: unanimous label -> LOCAL, served in-set",
+          r["route"] == "LOCAL" and r["answer"] == "build" and "label self-consistent" in r["why"]
+          and f.calls == 0, r["why"])
+    check("labelled: the samples are grammar-constrained to the label set",
+          v.grammars and v.grammars[0] == hybrid._labels_grammar(LABELS), str(v.grammars[0])[:30])
+
+    # rambly-but-consistent local answer still resolves to a label
+    v, f = Vote(fixed="The best category here is monitor, clearly."), Frontier()
+    r = with_fakes(v, f, lambda: hybrid.route_messages(CLASSIFY_SYS, MSG, labels=LABELS))
+    check("labelled: rambly-but-consistent answer normalizes to its label",
+          r["route"] == "LOCAL" and r["answer"] == "monitor", r["answer"])
+
+    # disagreement -> escalate
+    v, f = Vote(answers=["build", "research", "build"]), Frontier("build")
+    r = with_fakes(v, f, lambda: hybrid.route_messages(CLASSIFY_SYS, MSG, labels=LABELS))
+    check("labelled: split label vote -> ESCALATE",
+          r["route"] == "ESCALATE" and "self-inconsistent" in r["why"] and f.calls == 1, r["why"])
+
+    # no valid label from the local model -> escalate (never serves an invented label)
+    v, f = Vote(fixed="I have no idea"), Frontier("research")
+    r = with_fakes(v, f, lambda: hybrid.route_messages(CLASSIFY_SYS, MSG, labels=LABELS))
+    check("labelled: no in-set label on-box -> ESCALATE (never invents one)",
+          r["route"] == "ESCALATE" and "no valid label" in r["why"] and f.calls == 1, r["why"])
+
+    # a malformed labels payload falls back to plain instruction-following
+    v, f = Vote(fixed="build"), Frontier()
+    r = with_fakes(v, f, lambda: hybrid.route_messages(CLASSIFY_SYS, MSG, labels="not-a-list"))
+    check("labelled: malformed labels -> plain instruction-following path",
+          r["route"] == "LOCAL" and "instruction self-consistent" in r["why"], r["why"])
+
     # --- 7. the live endpoint over real loopback HTTP ---------------------------
     os.environ["HYBRID_API_KEY"] = "msg-secret"
     hybrid.ollama, hybrid.escalate = Vote(fixed="build"), Frontier("build")
@@ -154,6 +204,13 @@ def main():
               and j["content"][0]["type"] == "text" and j["content"][0]["text"] == "build", j.get("type"))
         check("response carries usage + x_hybrid route",
               j["usage"]["output_tokens"] >= 1 and j["x_hybrid"]["route"] == "LOCAL", j.get("x_hybrid"))
+
+        # metadata.hybrid_labels -> the labelled classification path, end to end
+        lbody = {**body, "metadata": {"hybrid_labels": ["build", "research", "monitor", "security"]}}
+        code, j = call("/v1/messages", lbody, {"content-type": "application/json", "x-api-key": "msg-secret"})
+        check("metadata.hybrid_labels routes the labelled path, serves an in-set label",
+              code == 200 and j["content"][0]["text"] == "build"
+              and "label self-consistent" in j["x_hybrid"]["why"], j.get("x_hybrid"))
 
         code, _ = call("/v1/messages", body, {"content-type": "application/json", "x-api-key": "wrong"})
         check("bad x-api-key -> 401", code == 401, code)

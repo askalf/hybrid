@@ -192,7 +192,7 @@ python server.py                               # OpenAI-compatible server on :80
 ```
 
 The oracle tiers and both harnesses (router + server tests) need **nothing** — no model,
-no network — so all 312 tests run anywhere, including CI.
+no network — so all 325 tests run anywhere, including CI.
 
 ### The llama.cpp transport — the GPU-less fast path
 
@@ -314,6 +314,26 @@ uncertain one would have escalated. `POST /v1/messages/count_tokens` returns the
 chars/4 estimate for clients that probe it. Streaming and the tool-using agent path are
 out of scope here — those need the real model; this door is for the cheap, text-only,
 Anthropic-shaped calls a fleet makes by the thousand.
+
+#### Labelled classification — constrain and verify, not vote and hope
+
+Most cheap Anthropic calls are *classification*: "pick one of these labels." The plain
+instruction-following vote handles it, but it votes on the raw text, so a rambly local
+answer breaks unanimity, and nothing stops the model inventing a label that isn't in
+your set. So a request can declare its label set — `metadata.hybrid_labels: ["build",
+"research", ...]` (a custom key real Anthropic ignores) — and hybrid switches to a
+**constrained-and-verified** path: it grammar-locks the local model to emit *exactly*
+one of your labels (GBNF, on the llama.cpp transport), samples it a few times, and
+normalizes each sample to the label it contains before voting. A served answer is then
+both **self-consistent** and **provably one you declared**; disagreement, or a sample
+with no in-set label, escalates. It's the verifier discipline — constrain the output,
+verify it's valid — applied to labels instead of arithmetic.
+
+Measured live, grammar-locked, on a real 3B over `["build","research","monitor",
+"security"]`: *harden our API against injection* → `security`, *set up a CI/CD pipeline*
+→ `build`, *track p99 latency and page me* → `monitor`, *compare vector databases* →
+`research` — every one on-box, unanimous, and guaranteed in-set. The model **cannot**
+return a category you didn't ask for.
 
 Capacity honesty: on a CPU box the *model* tiers run **seconds-to-a-minute per query**
 and effectively serially — that's memory bandwidth, not a bug. The solver and template
