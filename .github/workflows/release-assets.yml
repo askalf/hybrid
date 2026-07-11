@@ -1,0 +1,52 @@
+name: Release assets
+
+# Attaches the sdist + wheel and their Sigstore provenance bundle to every
+# GitHub release (Scorecard Signed-Releases). Runs independently of
+# publish.yml (the PyPI trusted publisher) so the OIDC publish job keeps its
+# minimal permissions. Verify: `gh attestation verify <file> --owner askalf`.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  attach:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # upload assets to the release
+      id-token: write # keyless Sigstore signing (attest-build-provenance)
+      attestations: write # persist the attestation in GitHub's store
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.11'
+
+      - name: Build sdist + wheel
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet --require-hashes -r .github/requirements-build.txt
+          python -m build
+          ls -l dist/
+
+      - name: Attest build provenance (keyless Sigstore)
+        id: attest
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: dist/*
+
+      - name: Upload dist + provenance bundle to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.release.tag_name }}
+          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          cp "$BUNDLE" "hybrid-router-${TAG}.sigstore.json"
+          gh release upload "$TAG" --clobber dist/* "hybrid-router-${TAG}.sigstore.json"
