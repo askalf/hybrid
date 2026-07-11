@@ -9,9 +9,15 @@ escalating only the hard ones to a frontier model — transparently.
     -d '{"model":"hybrid","messages":[{"role":"user","content":"capital of France?"}]}'
 
 Endpoints:
-  POST /v1/chat/completions   `stream: true` supported (SSE). Multi-turn: routing and
-                              the local tiers use the LAST user message; an escalated
-                              call carries the whole conversation to the frontier.
+  POST /v1/chat/completions   OpenAI shape. `stream: true` supported (SSE). Multi-turn:
+                              routing and the local tiers use the LAST user message; an
+                              escalated call carries the whole conversation to the frontier.
+  POST /v1/messages           Anthropic shape (non-streaming, text-only) — a second front
+                              door for Anthropic-shaped callers. Instruction-following
+                              aware: a task in the `system` prompt is voted on the local
+                              model with the caller's OWN prompt and escalated when
+                              uncertain (see hybrid.route_messages). Auth also accepts
+                              `x-api-key`. `POST /v1/messages/count_tokens` returns an estimate.
   GET  /v1/models
   GET  /health                (and /) — unauthenticated liveness + version
 
@@ -113,10 +119,13 @@ class H(BaseHTTPRequestHandler):
         key = os.environ.get("HYBRID_API_KEY", "")
         if not key:
             return True
-        got = self.headers.get("authorization", "")
-        if hmac.compare_digest(got, "Bearer " + key):
+        # accept either OpenAI-style `Authorization: Bearer <key>` or Anthropic-style
+        # `x-api-key: <key>` — the two front doors, one shared secret.
+        bearer = self.headers.get("authorization", "")
+        xkey = self.headers.get("x-api-key", "")
+        if hmac.compare_digest(bearer, "Bearer " + key) or hmac.compare_digest(xkey, key):
             return True
-        self._json(401, {"error": {"message": "missing or invalid bearer token",
+        self._json(401, {"error": {"message": "missing or invalid api key",
                                    "type": "invalid_request_error"}})
         return False
 
@@ -137,7 +146,9 @@ class H(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self._authed():
             return None                      # _authed already sent the 401
-        if not self.path.split("?")[0].rstrip("/").endswith("/chat/completions"):
+        path = self.path.split("?")[0].rstrip("/")
+        if not (path.endswith("/chat/completions") or path.endswith("/messages")
+                or path.endswith("/messages/count_tokens")):
             return self._json(404, {"error": {"message": "not found",
                                               "type": "invalid_request_error"}})
         try:
@@ -156,6 +167,12 @@ class H(BaseHTTPRequestHandler):
         except Exception:
             return self._json(400, {"error": {"message": "bad json",
                                               "type": "invalid_request_error"}})
+        # the Anthropic front door (POST /v1/messages) — a second surface for
+        # Anthropic-shaped callers; the OpenAI /chat/completions path continues below.
+        if path.endswith("/messages/count_tokens"):
+            return self._handle_count_tokens(req)
+        if path.endswith("/messages"):
+            return self._handle_messages(req)
         messages = req.get("messages") or []
         query = next((m.get("content", "") for m in reversed(messages)
                       if m.get("role") == "user"), "")
@@ -235,6 +252,71 @@ class H(BaseHTTPRequestHandler):
                          "message": {"role": "assistant", "content": r["answer"]}}],
             "usage": usage, "x_hybrid": xh,
         })
+
+    @staticmethod
+    def _sys_text(system):
+        """Anthropic `system` is a string or a list of text blocks -> plain text."""
+        if isinstance(system, list):
+            return "\n".join(b.get("text", "") for b in system if isinstance(b, dict))
+        return system or ""
+
+    def _handle_messages(self, req):
+        """POST /v1/messages — the Anthropic Messages surface. Non-streaming,
+        text-only. Routes via hybrid.route_messages (instruction-following aware)
+        and answers in Anthropic message shape."""
+        t0 = time.time()
+        messages = req.get("messages") or []
+        if not messages:
+            return self._json(400, {"type": "error", "error": {
+                "type": "invalid_request_error", "message": "no messages"}})
+        if req.get("stream"):
+            return self._json(400, {"type": "error", "error": {
+                "type": "invalid_request_error",
+                "message": "streaming is not supported on /v1/messages yet; send stream:false"}})
+        system = self._sys_text(req.get("system"))
+        try:
+            max_tokens = int(req.get("max_tokens") or 512)
+        except (TypeError, ValueError):
+            max_tokens = 512
+        r = hybrid.route_messages(system, messages, max_tokens=max_tokens)
+
+        xh = {"route": r["route"], "why": r["why"], "backend": r["backend"],
+              "latency_s": round(r["router_s"] + r["answer_s"], 2), "usage_estimated": True}
+        status = 502 if r["route"] == "ERROR" else 200
+        q = hybrid._anthropic_user_text(messages)
+        rec = {"ts": round(time.time(), 3), "route": r["route"], "why": r["why"],
+               "backend": r["backend"], "latency_s": xh["latency_s"],
+               "wall_s": round(time.time() - t0, 2), "status": status,
+               "api": "anthropic", "q_sha": hashlib.sha256(q.encode()).hexdigest()[:12],
+               "q_chars": len(q)}
+        if os.environ.get("HYBRID_LOG_QUERIES") == "1":
+            rec["query"] = q
+        _log_decision(rec)
+
+        if r["route"] == "ERROR":
+            return self._json(502, {"type": "error",
+                                    "error": {"type": "api_error", "message": r["answer"]},
+                                    "x_hybrid": xh})
+        in_text = system + " ".join(hybrid._block_text(m.get("content", "")) for m in messages
+                                    if isinstance(m, dict))
+        return self._json(200, {
+            "id": "msg_hybrid", "type": "message", "role": "assistant",
+            "model": f"hybrid:{'frontier' if r['route'] == 'ESCALATE' else 'local'}",
+            "content": [{"type": "text", "text": r["answer"]}],
+            "stop_reason": "end_turn", "stop_sequence": None,
+            "usage": {"input_tokens": _est_tokens(in_text),
+                      "output_tokens": _est_tokens(r["answer"])},
+            "x_hybrid": xh,
+        })
+
+    def _handle_count_tokens(self, req):
+        """POST /v1/messages/count_tokens — some Anthropic clients probe this before
+        a call. hybrid isn't token-metered, so return the same chars/4 estimate."""
+        system = self._sys_text(req.get("system"))
+        messages = req.get("messages") or []
+        text = system + " ".join(hybrid._block_text(m.get("content", "")) for m in messages
+                                 if isinstance(m, dict))
+        return self._json(200, {"input_tokens": _est_tokens(text)})
 
     def log_message(self, *a):
         pass                     # the decision log IS the access log

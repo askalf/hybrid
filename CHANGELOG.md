@@ -3,6 +3,30 @@
 All notable changes to hybrid are documented here. This project adheres to
 [Semantic Versioning](https://semver.org).
 
+## v1.9.0 — 2026-07-10
+
+**An Anthropic `/v1/messages` front door** — so the Anthropic-shaped callers a fleet
+is full of (inline `@anthropic-ai/sdk` `messages.create`, a base-URL-configurable
+client) can point at hybrid and get local-first routing with frontier escalation. The
+OpenAI `/v1/chat/completions` surface is unchanged.
+
+- **Instruction-following aware routing** (`route_messages`): Anthropic cheap calls put
+  the task in the `system` prompt (classify/extract/judge), not the user turn — so the
+  arithmetic tiers (which impose their own prompt) do NOT apply. When a `system`
+  instruction is present, hybrid votes with the local model on the CALLER'S OWN prompt;
+  unanimous serves on-box, otherwise the whole conversation escalates to the frontier.
+  No system prompt -> the user turn is a self-contained question and gets the full
+  router (verifier and all). A low-confidence local answer is never served.
+- **Server**: `POST /v1/messages` (non-streaming, text-only) + `/v1/messages/count_tokens`;
+  `x-api-key` auth accepted alongside `Authorization: Bearer`; Anthropic message/error
+  response shape; the decision log tags `api:"anthropic"`. Streaming and the tool-using
+  agent path are out of scope (they need the real model).
+- **Measured live** against a real 3B: dispatcher-style classification (build / research /
+  monitor) came back on-box, unanimous, and correct — an uncertain one would escalate.
+- Refactor: the failure policy (`_apply_failure_policy`) and the vote engine (`_vote`)
+  are factored out and shared by both surfaces — the OpenAI path is byte-identical
+  (full suite green before the new tests). New `test_messages.py` (19). Suite total 312.
+
 ## v1.8.0 — 2026-07-10
 
 **Load shedding — the tier that makes "production" honest.** On a CPU box the model

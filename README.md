@@ -192,7 +192,7 @@ python server.py                               # OpenAI-compatible server on :80
 ```
 
 The oracle tiers and both harnesses (router + server tests) need **nothing** — no model,
-no network — so all 293 tests run anywhere, including CI.
+no network — so all 312 tests run anywhere, including CI.
 
 ### The llama.cpp transport — the GPU-less fast path
 
@@ -287,6 +287,33 @@ deliberately bind beyond loopback.
 served from memory in ~0 ms with `x_hybrid.cached: true` — real traffic repeats, and a
 cache hit costs neither tokens nor bandwidth. Multi-turn requests, `ERROR` results, and
 `DEGRADED` answers are never cached; `HYBRID_CACHE_MAX` (default 512) caps entries, LRU.
+
+### The Anthropic front door — `POST /v1/messages`
+
+Most fleets are **Anthropic-shaped** — inline `@anthropic-ai/sdk` `messages.create`
+calls, or the Claude CLI, all speaking `/v1/messages`. So the server has a second front
+door in that shape (non-streaming, text-only), and `x-api-key` auth works alongside
+`Authorization: Bearer`. Point an Anthropic client's base URL at hybrid and its cheap
+calls route local-first.
+
+The catch it handles: those callers are usually **instruction-following** — the task is
+in the `system` prompt (*classify this / extract that / judge this*), not a self-contained
+question. hybrid's arithmetic tiers impose their own prompt, so running the solver on the
+user text would answer the wrong thing. `route_messages` branches on it:
+
+- **No `system`** → the user turn is a self-contained question → the full router (solver,
+  templates, verifier, vote, escalate), verifier and all.
+- **A `system` instruction present** → self-consistency on the **caller's own prompt**
+  (system + turns) with the local model; unanimous → serve on-box (free), otherwise
+  escalate the whole conversation to the frontier. The instruction is respected, and a
+  low-confidence local answer is never served — the frontier catches the hard ones.
+
+Measured live against a real 3B, classifying the way a dispatcher does — `build`,
+`research`, `monitor` — all three came back **on-box, unanimous, and correct**; an
+uncertain one would have escalated. `POST /v1/messages/count_tokens` returns the same
+chars/4 estimate for clients that probe it. Streaming and the tool-using agent path are
+out of scope here — those need the real model; this door is for the cheap, text-only,
+Anthropic-shaped calls a fleet makes by the thousand.
 
 Capacity honesty: on a CPU box the *model* tiers run **seconds-to-a-minute per query**
 and effectively serially — that's memory bandwidth, not a bug. The solver and template
