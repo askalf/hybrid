@@ -1,7 +1,7 @@
 # hybrid — local-first LLM router. Stdlib only, so the image is python:slim + five files.
 FROM python:3.12-slim@sha256:423ed6ab25b1921a477529254bfeeabf5855151dc2c3141699a1bfc852199fbf
 WORKDIR /app
-COPY hybrid.py solver.py verify.py equations.py server.py ./
+COPY hybrid.py solver.py templates.py verify.py equations.py server.py ./
 
 # 0.0.0.0 binds inside the container's namespace; publish the port deliberately
 # (compose maps it to loopback) and set HYBRID_API_KEY if you expose it wider.
