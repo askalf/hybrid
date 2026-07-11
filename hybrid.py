@@ -78,7 +78,7 @@ import equations
 import templates
 import verify
 
-__version__ = "1.8.0"
+__version__ = "1.9.0"
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # Windows cp1252 chokes on non-ASCII
@@ -372,10 +372,17 @@ def local_consistency(query, k=3):
     ramble no key extraction reads."""
     if os.environ.get("HYBRID_VOTE_FAST", "") == "1":
         k = 2
+    return _vote(CONCISE.format(q=query), k, LOCAL_MODEL_FAST, 56)
+
+
+def _vote(prompt, k, model, num_predict):
+    """Sample `model` on `prompt` k times concurrently at temperature 0.6; return
+    (unanimous, best_sample, "n/k", secs). The shared engine behind both the
+    self-contained-question vote (local_consistency, hybrid's own CONCISE prompt)
+    and the instruction-following vote (route_messages, the CALLER's own prompt)."""
     t0 = time.time()
     with ThreadPoolExecutor(max_workers=k) as ex:
-        futures = [ex.submit(ollama, CONCISE.format(q=query), 56, 0.6, LOCAL_MODEL_FAST)
-                   for _ in range(k)]
+        futures = [ex.submit(ollama, prompt, num_predict, 0.6, model) for _ in range(k)]
         samples = [f.result()[0] for f in futures]
     t = time.time() - t0
     keys = [_key(s) for s in samples]
@@ -438,6 +445,32 @@ def _leave_model():
         _MODEL_INFLIGHT = max(0, _MODEL_INFLIGHT - 1)
 
 
+def _apply_failure_policy(e, query, messages):
+    """Turn a BackendError into a degraded route or an ERROR result per the
+    HYBRID_ON_*_FAIL env policy. Shared by route() and route_messages() so both
+    surfaces degrade identically instead of raising."""
+    if e.tier == "local" and os.environ.get("HYBRID_ON_LOCAL_FAIL", "escalate") == "escalate":
+        try:
+            ans, dt = _escalate(query, messages)
+            return {"route": "ESCALATE", "why": "local backend down -> frontier",
+                    "backend": FRONTIER_MODEL, "answer": ans,
+                    "router_s": 0.0, "answer_s": round(dt, 2)}
+        except BackendError as e2:
+            e = e2                        # frontier is down too -> ERROR below
+    elif e.tier == "frontier" and os.environ.get("HYBRID_ON_FRONTIER_FAIL", "error") == "local":
+        try:
+            ans, dt = ollama(CONCISE.format(q=query), num_predict=200,
+                             model=LOCAL_MODEL_FAST)
+            return {"route": "LOCAL", "why": "DEGRADED: frontier down, unverified local",
+                    "backend": LOCAL_MODEL_FAST, "answer": ans,
+                    "router_s": 0.0, "answer_s": round(dt, 2)}
+        except BackendError as e2:
+            e = e2
+    return {"route": "ERROR", "why": f"{e.tier} backend unavailable",
+            "backend": e.tier, "answer": f"[{e.tier} backend unavailable: {e}]",
+            "router_s": 0.0, "answer_s": 0.0, "error": True}
+
+
 def route(query, messages=None):
     """Route one query. `messages` (optional) is the full OpenAI-style conversation:
     routing decisions and the LOCAL tiers always work on `query` — the last user
@@ -448,26 +481,7 @@ def route(query, messages=None):
     try:
         return _route(query, messages)
     except BackendError as e:
-        if e.tier == "local" and os.environ.get("HYBRID_ON_LOCAL_FAIL", "escalate") == "escalate":
-            try:
-                ans, dt = _escalate(query, messages)
-                return {"route": "ESCALATE", "why": "local backend down -> frontier",
-                        "backend": FRONTIER_MODEL, "answer": ans,
-                        "router_s": 0.0, "answer_s": round(dt, 2)}
-            except BackendError as e2:
-                e = e2                        # frontier is down too -> ERROR below
-        elif e.tier == "frontier" and os.environ.get("HYBRID_ON_FRONTIER_FAIL", "error") == "local":
-            try:
-                ans, dt = ollama(CONCISE.format(q=query), num_predict=200,
-                                 model=LOCAL_MODEL_FAST)
-                return {"route": "LOCAL", "why": "DEGRADED: frontier down, unverified local",
-                        "backend": LOCAL_MODEL_FAST, "answer": ans,
-                        "router_s": 0.0, "answer_s": round(dt, 2)}
-            except BackendError as e2:
-                e = e2
-        return {"route": "ERROR", "why": f"{e.tier} backend unavailable",
-                "backend": e.tier, "answer": f"[{e.tier} backend unavailable: {e}]",
-                "router_s": 0.0, "answer_s": 0.0, "error": True}
+        return _apply_failure_policy(e, query, messages)
 
 
 def _route(query, messages=None):
@@ -631,6 +645,118 @@ def _route_two_call(query, messages):
     ans, dt = _escalate(query, messages)
     return {"route": "ESCALATE", "why": "uncertain (self-inconsistent)", "backend": FRONTIER_MODEL,
             "answer": ans, "router_s": round(ct, 2), "answer_s": round(dt, 2)}
+
+
+# ── Anthropic Messages surface ───────────────────────────────────────────────
+# A second front door that speaks the Anthropic /v1/messages shape, so the
+# Anthropic-shaped callers a fleet is full of (inline @anthropic-ai/sdk
+# `messages.create`, a base-URL-configurable client) can point at hybrid and get
+# local-first routing with frontier escalation. The KEY difference from the
+# OpenAI surface: those callers are usually *instruction-following* — the task
+# lives in the `system` prompt (classify / extract / judge), not in the user
+# turn. hybrid's arithmetic tiers impose their OWN prompt and so would ignore
+# that instruction; running the deterministic solver on the user text would even
+# answer the wrong question. So route_messages() branches on whether a system
+# instruction is present (see below). Text-only, non-streaming — the cheap
+# `messages.create` calls this targets don't stream, and the full agent/CLI
+# path (tools, streaming) needs the real model anyway.
+
+def _block_text(content):
+    """Anthropic message content -> plain text. A turn's content is either a
+    string or a list of blocks ([{type:'text',text:...}, ...]); non-text blocks
+    (images, tool_use) are skipped — this surface is text-only."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(b.get("text", "") for b in content
+                         if isinstance(b, dict) and b.get("type", "text") == "text")
+    return ""
+
+
+def _anthropic_user_text(messages):
+    """The last user turn's text — the 'query' hybrid's self-contained tiers see."""
+    for m in reversed(messages or []):
+        if isinstance(m, dict) and m.get("role") == "user":
+            return _block_text(m.get("content", "")).strip()
+    return ""
+
+
+def _anthropic_to_openai(system, messages):
+    """Anthropic (system + messages) -> an OpenAI-style message list for the
+    escalation payload, so an escalated call carries the whole conversation AND
+    the system instruction to the frontier."""
+    out = []
+    if system and str(system).strip():
+        out.append({"role": "system", "content": str(system)})
+    for m in messages or []:
+        if isinstance(m, dict) and m.get("role") in ("user", "assistant"):
+            out.append({"role": m["role"], "content": _block_text(m.get("content", ""))})
+    return out
+
+
+def _render_prompt(system, messages):
+    """Render (system + conversation) into ONE prompt string for the local model —
+    used only by the instruction-following vote, so the local model sees the
+    caller's ACTUAL task (its system instruction), not hybrid's CONCISE rewrite.
+    ollama()'s llamacpp transport splits on '\\nQuestion: ' into the template's
+    system/user slots; the ollama transport sends it verbatim."""
+    parts = []
+    if system and str(system).strip():
+        parts.append(str(system).strip())
+    for m in messages or []:
+        if not isinstance(m, dict) or m.get("role") not in ("user", "assistant"):
+            continue
+        who = "Assistant" if m["role"] == "assistant" else "User"
+        parts.append(f"{who}: {_block_text(m.get('content', '')).strip()}")
+    return "\n".join(parts) + "\nQuestion: (respond to the last User turn following the instructions above)"
+
+
+def route_messages(system, messages, max_tokens=512):
+    """Route an Anthropic-style request. Two modes, chosen by whether a system
+    instruction is present:
+
+      - NO system instruction: the last user turn is a self-contained question, so
+        run the full router (solve / template / verify / vote / escalate) — the
+        arithmetic verifier and all — on it.
+      - A system instruction IS present: this is instruction-following (classify /
+        extract / judge). The deterministic solver does NOT apply (the task is not
+        'answer the user text'), so we vote with the local model on the CALLER'S
+        OWN prompt; unanimous -> serve local (free), otherwise escalate the whole
+        conversation to the frontier. This respects the instruction and never
+        serves a low-confidence local answer — the frontier catches the hard ones.
+
+    Same dict shape and failure policy as route()."""
+    user_text = _anthropic_user_text(messages)
+    oai = _anthropic_to_openai(system, messages)
+    if not (system and str(system).strip()):
+        return route(user_text, oai)
+    try:
+        return _route_messages_instructed(system, messages, user_text, oai, max_tokens)
+    except BackendError as e:
+        return _apply_failure_policy(e, user_text, oai)
+
+
+def _route_messages_instructed(system, messages, user_text, oai, max_tokens):
+    # everything here does model work -> obey the load-shed gate, like _route
+    shed = _enter_model_or_shed(0.0)
+    if shed:
+        ans, dt = _escalate(user_text, oai)
+        return {"route": "ESCALATE", "why": shed, "backend": FRONTIER_MODEL,
+                "answer": ans, "router_s": 0.0, "answer_s": round(dt, 2)}
+    try:
+        k = 2 if os.environ.get("HYBRID_VOTE_FAST", "") == "1" else 3
+        budget = max(48, min(int(max_tokens or 256), 256))  # vote answers stay short enough to compare
+        confident, best, agree, ct = _vote(_render_prompt(system, messages), k, LOCAL_MODEL_FAST, budget)
+    finally:
+        _leave_model()
+    if confident:
+        return {"route": "LOCAL", "why": f"instruction self-consistent {agree}",
+                "backend": LOCAL_MODEL_FAST, "answer": best,
+                "router_s": round(ct, 2), "answer_s": 0.0}
+    ans, dt = _escalate(user_text, oai)
+    return {"route": "ESCALATE", "why": "instruction uncertain (self-inconsistent)",
+            "backend": FRONTIER_MODEL, "answer": ans,
+            "router_s": round(ct, 2), "answer_s": round(dt, 2)}
 
 
 DEMO = [
