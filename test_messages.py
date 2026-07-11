@@ -33,9 +33,12 @@ class Vote:
         self.prompts = []
         self.grammars = []
 
-    def __call__(self, prompt, num_predict=256, temperature=0.0, model=None, grammar=None):
+    def __call__(self, prompt, num_predict=256, temperature=0.0, model=None, grammar=None,
+                 family=None):   # family = slot-pinning arg; matches ollama()'s signature
         self.prompts.append(prompt)
         self.grammars.append(grammar)
+        self.families = getattr(self, "families", [])
+        self.families.append(family)
         if self.fail:
             raise hybrid.BackendError("local", "down (fake)")
         if self.fixed is not None:

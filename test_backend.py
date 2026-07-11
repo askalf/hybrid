@@ -27,7 +27,8 @@ def check(name, cond, detail=""):
 
 
 REQUESTS = []
-BEHAVIOR = {"fail_times": 0}
+GETS = []
+BEHAVIOR = {"fail_times": 0, "n_slots": 3, "content": " 42 "}
 
 
 class FakeLlamaServer(BaseHTTPRequestHandler):
@@ -41,7 +42,20 @@ class FakeLlamaServer(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b"boom")
             return
-        out = json.dumps({"content": " 42 ", "timings": {"prompt_n": 1}}).encode()
+        out = json.dumps({"content": BEHAVIOR["content"],
+                          "timings": {"prompt_n": 1}}).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.end_headers()
+        self.wfile.write(out)
+
+    def do_GET(self):  # llama-server's GET /slots monitoring endpoint
+        GETS.append(self.path)
+        if self.path != "/slots" or BEHAVIOR["n_slots"] is None:
+            self.send_response(404)
+            self.end_headers()
+            return
+        out = json.dumps([{"id": i} for i in range(BEHAVIOR["n_slots"])]).encode()
         self.send_response(200)
         self.send_header("content-type", "application/json")
         self.end_headers()
@@ -126,6 +140,56 @@ def main():
           REQUESTS[-1]["_port"] == main_port, REQUESTS[-1]["_port"])
     hybrid.LOCAL_MODEL_FAST = saved_fast
     srv_fast.shutdown()
+
+    # --- slot pinning (prompt families) --------------------------------------
+    check("unpinned calls carry no id_slot and never probed /slots",
+          all("id_slot" not in r for r in REQUESTS) and not GETS, GETS)
+
+    hybrid.ollama("classify\nQuestion: a?", family="famA")
+    a1 = REQUESTS[-1].get("id_slot")
+    hybrid.ollama("classify\nQuestion: b?", family="famA")
+    a2 = REQUESTS[-1].get("id_slot")
+    check("a family pins to a slot in range", a1 is not None and 0 <= a1 < 3, a1)
+    check("same family -> same slot across calls", a1 == a2, f"{a1} vs {a2}")
+    expected = int(__import__("hashlib").sha1(b"famA").hexdigest()[:8], 16) % 3
+    check("the slot is the stable hash of the family (restart-stable)",
+          a1 == expected, f"{a1} vs {expected}")
+    hybrid.ollama("classify\nQuestion: c?", family="famB-different")
+    check("/slots probed exactly once (cached per server)",
+          GETS.count("/slots") == 1, GETS)
+
+    os.environ["HYBRID_SLOT_PIN"] = "0"
+    hybrid.ollama("classify\nQuestion: d?", family="famA")
+    check("HYBRID_SLOT_PIN=0 is the escape hatch (no id_slot)",
+          "id_slot" not in REQUESTS[-1], list(REQUESTS[-1]))
+    os.environ.pop("HYBRID_SLOT_PIN")
+
+    BEHAVIOR["n_slots"] = None   # a server without the /slots endpoint
+    srv_noslots = HTTPServer(("127.0.0.1", 0), FakeLlamaServer)
+    threading.Thread(target=srv_noslots.serve_forever, daemon=True).start()
+    saved_url = hybrid.LLAMACPP_URL
+    hybrid.LLAMACPP_URL = f"http://127.0.0.1:{srv_noslots.server_port}/completion"
+    hybrid.ollama("classify\nQuestion: e?", family="famA")
+    check("no /slots endpoint -> pinning degrades to unpinned, call still works",
+          "id_slot" not in REQUESTS[-1] and REQUESTS[-1]["_port"] == srv_noslots.server_port,
+          list(REQUESTS[-1])[-3:])
+    hybrid.LLAMACPP_URL = saved_url
+    srv_noslots.shutdown()
+    BEHAVIOR["n_slots"] = 3
+
+    # the labelled-classification vote: all k samples ride the SAME pinned slot
+    BEHAVIOR["content"] = " build "
+    res = hybrid._route_messages_labeled(
+        "Classify into exactly one category.",
+        [{"role": "user", "content": "set up CI for my repo"}],
+        "set up CI for my repo", None, ["build", "research"])
+    slots = [r.get("id_slot") for r in REQUESTS[-3:]]
+    check("labelled vote: 3/3 samples pinned to one family slot",
+          slots[0] is not None and len(set(slots)) == 1, slots)
+    check("labelled vote still serves the grammar-locked label",
+          res["route"] == "LOCAL" and res["answer"] == "build",
+          f"{res['route']}/{res['answer']}")
+    BEHAVIOR["content"] = " 42 "
 
     # --- grammar sanity pins -------------------------------------------------
     for name, g in (("setup", hybrid.GRAMMAR_SETUP), ("fused", hybrid.GRAMMAR_FUSED)):

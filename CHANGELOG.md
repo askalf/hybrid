@@ -3,6 +3,34 @@
 All notable changes to hybrid are documented here. This project adheres to
 [Semantic Versioning](https://semver.org).
 
+## v1.11.0 — 2026-07-11
+
+**Slot pinning — prompt families keep their prefill.** `cache_prompt` only reuses a
+prefill when the matching KV sits in the slot a request happens to land on. llama-server
+spreads unpinned requests across slots, so a family of requests sharing a long fixed
+prefix (a classifier's system prompt) keeps re-prefilling that prefix — worst in the
+k-sample vote, where k IDENTICAL prompts land on k slots and prefill k times
+simultaneously.
+
+- The llamacpp transport now pins a request's **prompt family** to one server slot:
+  `ollama(..., family=...)` sets `id_slot` to a stable hash of the family name modulo
+  the server's slot count (discovered once via `GET /slots`). Same family → same slot,
+  every process, every restart. The labelled-classification vote passes its family
+  (system prompt + label set), so sample 1 prefills and samples 2..k reuse the whole
+  prompt; the prefix then stays hot for the classifier's next request.
+- **Measured** on a real llama-server (3B, `--parallel 3`, fresh server per mode, same
+  six forge-shaped requests): cold classify 9434ms → 3571ms (**2.6×**), warm p50
+  3175ms → 1623ms (**2.0×**). Labels chosen were identical in both modes — pinning
+  changes where work lands, never what is answered.
+- Pinned only where decode is tiny and the prefix dominates (grammar-locked labels:
+  1–4 tokens). Long-decode votes stay unpinned on purpose — they gain more from
+  batching across slots than they lose re-prefilling.
+- Degrades to exactly the old behavior when the server does not expose `GET /slots`
+  (`--no-slots`), and `HYBRID_SLOT_PIN=0` is the escape hatch. No new required config.
+- `test_backend.py` grows the fake server a `/slots` endpoint and pins the behavior:
+  stable slot per family, one probe per server, escape hatch, no-endpoint degradation,
+  and the labelled vote riding one slot. Suite total 334.
+
 ## v1.10.0 — 2026-07-10
 
 **Labelled classification on the Anthropic endpoint — constrain and verify, not vote

@@ -197,7 +197,7 @@ no network — so all 325 tests run anywhere, including CI.
 ### The llama.cpp transport — the GPU-less fast path
 
 Ollama is the friendly default; llama.cpp's own server is the fast one. Point hybrid at
-a [`llama-server`](https://github.com/ggml-org/llama.cpp) and the router turns on three
+a [`llama-server`](https://github.com/ggml-org/llama.cpp) and the router turns on four
 things Ollama's generate API can't express, all aimed at the two places CPU inference
 actually hurts:
 
@@ -227,6 +227,18 @@ export LOCAL_MODEL_FAST=qwen2.5:3b LLAMACPP_URL_FAST=http://127.0.0.1:8081/compl
   54 s → 6.5 s on the worst live case) and then cost a SECOND call as the tier falls
   through unparsed. A grammar also cannot write units inside a `CHECK:` line, which
   was a documented fall-through class. `HYBRID_GRAMMAR=0` turns it off.
+- **Slot pinning** (prompt families). `cache_prompt` only helps when the matching KV is
+  in the slot a request lands on — and llama-server spreads unpinned requests across
+  slots, so a classifier that always sends the same system prompt keeps re-prefilling
+  it in whichever slot each request hits. Worst case is the k-sample vote: k IDENTICAL
+  prompts land on k slots and prefill k times at once. The transport pins each **prompt
+  family** (labelled classification: system prompt + label set) to one slot, so sample
+  1 prefills, samples 2..k reuse the whole prompt, and the prefix stays hot for the
+  family's next request. Measured (3B, `--parallel 3`, six forge-shaped classify
+  requests): cold 9434 → 3571 ms (**2.6×**), warm p50 3175 → 1623 ms (**2.0×**), with
+  identical labels chosen — it moves work, it never changes answers. Applied only where
+  decode is tiny (grammar-locked labels); long-decode votes still batch across slots.
+  Needs `GET /slots` exposed (llama-server's default); `HYBRID_SLOT_PIN=0` disables.
 #### Same box, same GGUF, two transports (i7-4770 8-thread, qwen2.5:7b Q4_K_M, frontier stubbed)
 
 | transport | bench 22q on-box | bench safety | bench wall | stress 26q on-box | stress wrong-served | stress wall |
@@ -367,6 +379,7 @@ is a hardened systemd unit (`DynamicUser`, `ProtectSystem=strict`) where
 | `HYBRID_LOG_QUERIES` | off | `1` = include query text in the decision log |
 | `HYBRID_CACHE_TTL` | `0` (off) | seconds to serve repeated single-turn queries from memory (~0 ms hits) |
 | `HYBRID_CACHE_MAX` | `512` | answer-cache entry cap, LRU-evicted |
+| `HYBRID_SLOT_PIN` | `1` | llamacpp transport: pin prompt families to a server slot (needs `GET /slots`); `0` disables |
 
 `FRONTIER_URL` is just an OpenAI-compatible chat endpoint — OpenAI, a local proxy, or your
 own gateway. The key only ever leaves your machine on an *escalated* query.
