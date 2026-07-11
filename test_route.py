@@ -299,7 +299,7 @@ def main():
 
     # default (ollama transport): fusion OFF -> the two-call flow, setup first
     fm, ff = FakeModel(), FakeFrontier()
-    r = run(BAT_ODD, fm, ff, env={"HYBRID_FUSE": "0"})
+    run(BAT_ODD, fm, ff, env={"HYBRID_FUSE": "0"})
     check("HYBRID_FUSE=0 keeps the two-call flow (setup then verify)",
           fm.kinds[:2] == ["setup", "verify"], ",".join(fm.kinds))
     check("two-call setup carries the setup grammar",
