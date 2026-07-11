@@ -69,8 +69,18 @@ never shed — they cost nothing and answer regardless.
                            SLA and escalates the rest".
   HYBRID_MODEL_TIER_MS       8000 — the estimated wall cost of one model tier, for the
                            budget projection. Set it to your box's measured p50.
+
+Slot pinning (llamacpp transport) — treat a request's stable instruction prefix as a
+PROMPT FAMILY and pin the family to one server slot, so its prefill survives in that
+slot's KV cache instead of being redone per request (and per vote sample). Used only
+where decode is tiny and the prefix dominates (labelled classification); long-decode
+votes stay unpinned — they benefit more from batching across slots.
+  HYBRID_SLOT_PIN            1 (default) | 0
+                           0 disables pinning entirely. With 1, pinning still engages
+                           only when the server exposes GET /slots (llama-server default;
+                           --no-slots turns it off) — otherwise behavior is unchanged.
 """
-import sys, os, time, json, re, threading, urllib.request
+import sys, os, time, json, re, threading, urllib.request, hashlib
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from solver import solve
@@ -78,7 +88,7 @@ import equations
 import templates
 import verify
 
-__version__ = "1.10.0"
+__version__ = "1.11.0"
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # Windows cp1252 chokes on non-ASCII
@@ -279,14 +289,61 @@ def _llamacpp_body(prompt, num_predict, temperature, grammar):
     return body
 
 
-def ollama(prompt, num_predict=256, temperature=0.0, model=None, grammar=None):
+# ── Slot pinning ─────────────────────────────────────────────────────────────
+# cache_prompt reuses a prefill only when the matching KV is in the SLOT the
+# request lands on. llama-server distributes unpinned requests across slots, so
+# a family of requests sharing a long instruction prefix (a classifier's system
+# prompt) keeps re-prefilling that prefix in whichever slot each request happens
+# to hit — worst in the k-sample vote, where k IDENTICAL prompts land on k slots
+# and prefill k times. Pinning the family to one slot (id_slot) makes the server
+# queue them there instead: the first request prefills, the rest reuse. Decode is
+# what serializes, so this is only worth it where decode is tiny (grammar-locked
+# labels: 1-4 tokens); long-decode votes are better off batching across slots.
+_SLOTS_LOCK = threading.Lock()
+_SLOTS_CACHE = {}  # server root URL -> slot count (0 = endpoint absent/disabled)
+
+
+def _llamacpp_slots(url):
+    """Slot count of the llama-server behind `url` (a .../completion endpoint),
+    probed once via GET /slots and cached. 0 means unknown — callers skip pinning.
+    Never raises: a server without the endpoint just gets unpinned behavior."""
+    root = url.rsplit("/completion", 1)[0]
+    with _SLOTS_LOCK:
+        if root in _SLOTS_CACHE:
+            return _SLOTS_CACHE[root]
+    n = 0
+    try:
+        r = json.loads(urllib.request.urlopen(root + "/slots", timeout=5).read())
+        if isinstance(r, list):
+            n = len(r)
+    except Exception:
+        n = 0
+    with _SLOTS_LOCK:
+        _SLOTS_CACHE[root] = n
+    return n
+
+
+def _pin_slot(body, url, family):
+    """Add id_slot to a /completion body: a stable hash of the family name, modulo
+    the server's slot count. Same family -> same slot, every process, every run."""
+    if not family or os.environ.get("HYBRID_SLOT_PIN", "1") == "0":
+        return
+    n = _llamacpp_slots(url)
+    if n > 0:
+        h = int(hashlib.sha1(family.encode("utf-8", "replace")).hexdigest()[:8], 16)
+        body["id_slot"] = h % n
+
+
+def ollama(prompt, num_predict=256, temperature=0.0, model=None, grammar=None,
+           family=None):
     """One local-model call (default LOCAL_MODEL; the vote/creative tiers pass
     LOCAL_MODEL_FAST). Retries once (transports flake), then raises BackendError —
     an answer string is ALWAYS a real model answer, never an error in disguise.
     With HYBRID_LOCAL_BACKEND=llamacpp the same call goes to llama-server's native
     /completion instead (prefix cache + optional GBNF grammar; `model` is whatever
     the server loaded). `grammar` is ignored on the Ollama transport — the generate
-    API has no grammar parameter."""
+    API has no grammar parameter. `family` (llamacpp only) names the request's
+    prompt family for slot pinning — see _pin_slot; None (default) pins nothing."""
     if LOCAL_BACKEND == "llamacpp":
         # the fast-tier calls (they pass model=LOCAL_MODEL_FAST) go to the fast server
         # when one is configured; transcription calls never do — same pinned policy as
@@ -294,7 +351,9 @@ def ollama(prompt, num_predict=256, temperature=0.0, model=None, grammar=None):
         fast = (LLAMACPP_URL_FAST and model is not None
                 and model == LOCAL_MODEL_FAST and model != LOCAL_MODEL)
         url = LLAMACPP_URL_FAST if fast else LLAMACPP_URL
-        body = json.dumps(_llamacpp_body(prompt, num_predict, temperature, grammar)).encode()
+        body_dict = _llamacpp_body(prompt, num_predict, temperature, grammar)
+        _pin_slot(body_dict, url, family)
+        body = json.dumps(body_dict).encode()
     else:
         url = OLLAMA_URL
         body = json.dumps({
@@ -768,9 +827,17 @@ def _route_messages_labeled(system, messages, user_text, oai, labels):
         k = 2 if os.environ.get("HYBRID_VOTE_FAST", "") == "1" else 3
         grammar = _labels_grammar(labels)
         prompt = _render_prompt(system, messages)
+        # One classifier = one family: same system prompt + same label set. Pinning
+        # the k samples to that family's slot means sample 1 prefills the prompt and
+        # samples 2..k reuse it whole (identical prompt, decode-only) — instead of k
+        # slots each prefilling from scratch. The prefix then stays hot in that slot
+        # for the classifier's NEXT request. Decode is 1-4 grammar-locked tokens, so
+        # the serialization this causes costs far less than the prefills it saves.
+        fam = "labels\x1f" + str(system or "") + "\x1f" + "\x1f".join(labels)
         t0 = time.time()
         with ThreadPoolExecutor(max_workers=k) as ex:
-            futures = [ex.submit(ollama, prompt, 16, 0.6, LOCAL_MODEL_FAST, grammar)
+            futures = [ex.submit(ollama, prompt, 16, 0.6, LOCAL_MODEL_FAST, grammar,
+                                 fam)
                        for _ in range(k)]
             picks = [_extract_label(f.result()[0], labels) for f in futures]
         ct = time.time() - t0
