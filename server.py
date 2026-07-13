@@ -46,6 +46,11 @@ service can be re-tuned without a restart):
                       Multi-turn requests, ERROR results, and DEGRADED answers are
                       never cached.
   HYBRID_CACHE_MAX    per-request. Cache entry cap, LRU-evicted (default 512).
+  HYBRID_WARMUP       startup. "1" primes the local backend on boot: one throwaway
+                      forward pass per fixed local tier so its prefill (the CPU
+                      compute-bound wall) is hot before real traffic. No routing,
+                      no frontier call; failures are logged, never fatal. Prefills
+                      are in-memory, so this re-runs each restart. Default off.
 """
 import hashlib, hmac, json, os, sys, threading, time
 from collections import OrderedDict
@@ -332,6 +337,10 @@ def main():
     print(f"hybrid v{hybrid.__version__} -> http://{HOST}:{PORT}/v1  (model 'hybrid', "
           f"stream ok)   health: /health   decision log: "
           f"{os.environ.get('HYBRID_LOG', 'stdout')}", file=sys.stderr)
+    if os.environ.get("HYBRID_WARMUP", "0").strip().lower() not in ("0", "", "false", "no", "off"):
+        t0 = time.time()
+        summary = hybrid.warmup()
+        print(f"hybrid warmup ({time.time() - t0:.1f}s): {summary}", file=sys.stderr)
     ThreadingHTTPServer((HOST, PORT), H).serve_forever()
 
 

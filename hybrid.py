@@ -563,6 +563,43 @@ def _apply_failure_policy(e, query, messages):
             "router_s": 0.0, "answer_s": 0.0, "error": True}
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# Startup warmup (HYBRID_WARMUP=1, see server.py). On a CPU, prefill is the
+# compute-bound wall (~seconds per uncached instruction preamble), so a freshly
+# started / redeployed container serves its opening traffic slowly until the KV
+# cache fills. Warmup carries each FIXED local tier's preamble through one
+# throwaway forward pass up front so the prefill (and, for pinned families, the
+# slot) is hot before real traffic arrives. In-memory only — re-run per restart.
+# ─────────────────────────────────────────────────────────────────────────
+
+# The preamble — not the query — is what cache_prompt/prefill amortizes, so the
+# trivial query is irrelevant and num_predict=1 keeps decode negligible. The
+# caller-supplied LABELLED-classifier preamble (route_messages) depends on the
+# runtime system+labels, so it can't be primed blind at boot and is not warmed
+# here — only the router's own fixed-template tiers are.
+_WARMUP_TIERS = (
+    ("concise", lambda: CONCISE.format(q="hello"), LOCAL_MODEL_FAST),
+    ("derive",  lambda: FUSED_PROMPT.format(q="What is 2 plus 2?"), LOCAL_MODEL),
+)
+
+
+def warmup():
+    """Prime the local backend before serving. Sends one throwaway forward pass per
+    fixed tier DIRECTLY to the local model — no routing, no escalation, no frontier
+    call — so each tier's preamble lands in the prefill cache and the model loads.
+    Never raises: a cold or unreachable backend records an error marker and startup
+    proceeds unblocked. Returns {tier: seconds} (or {tier: "err: <Type>"})."""
+    out = {}
+    for name, make_prompt, model in _WARMUP_TIERS:
+        t0 = time.time()
+        try:
+            ollama(make_prompt(), num_predict=1, temperature=0.0, model=model)
+            out[name] = round(time.time() - t0, 2)
+        except Exception as e:  # BackendError / transport flake — warmup is best-effort
+            out[name] = f"err: {type(e).__name__}"
+    return out
+
+
 def route(query, messages=None):
     """Route one query. `messages` (optional) is the full OpenAI-style conversation:
     routing decisions and the LOCAL tiers always work on `query` — the last user
