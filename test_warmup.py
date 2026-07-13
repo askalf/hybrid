@@ -82,6 +82,7 @@ def main():
     rec3 = RecordingModel(fail=True)
     hybrid.ollama = rec3
     raised = False
+    res3 = {}
     try:
         res3 = hybrid.warmup()
     except Exception:
