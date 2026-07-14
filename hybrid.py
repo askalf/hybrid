@@ -99,7 +99,7 @@ import equations
 import templates
 import verify
 
-__version__ = "1.12.0"
+__version__ = "1.13.0"
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # Windows cp1252 chokes on non-ASCII

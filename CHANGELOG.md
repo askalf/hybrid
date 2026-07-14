@@ -3,7 +3,16 @@
 All notable changes to hybrid are documented here. This project adheres to
 [Semantic Versioning](https://semver.org).
 
-## Unreleased
+## v1.13.0 — 2026-07-14
+
+**Startup warmup (`HYBRID_WARMUP=1`).** On a CPU box, prefill is the compute-bound
+wall, so a freshly restarted container serves its opening traffic slowly until the
+KV cache fills. Opt-in warmup carries each fixed local tier's instruction preamble
+through one throwaway forward pass (`num_predict=1`) at boot — no routing, no
+escalation, no frontier spend, and a cold backend never blocks startup. The
+caller-dependent labelled-classifier preamble cannot be primed blind and is
+deliberately not warmed.
+
 
 **Token accounting — the decision log now records measured spend.** The log had
 latency but not tokens, so the savings thesis could not be quantified from real
