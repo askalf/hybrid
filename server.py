@@ -211,6 +211,10 @@ class H(BaseHTTPRequestHandler):
                "stream": bool(req.get("stream")),
                "q_sha": key[:12],
                "q_chars": len(query)}
+        # measured backend spend (hybrid._tokens_reset) — a cache hit spent nothing,
+        # so the stored route's counts are NOT logged again
+        if not cached and "tokens" in r:
+            rec["tokens"] = r["tokens"]
         if cached:
             rec["cached"] = True
         if os.environ.get("HYBRID_LOG_QUERIES") == "1":
@@ -299,6 +303,8 @@ class H(BaseHTTPRequestHandler):
                "wall_s": round(time.time() - t0, 2), "status": status,
                "api": "anthropic", "q_sha": hashlib.sha256(q.encode()).hexdigest()[:12],
                "q_chars": len(q)}
+        if "tokens" in r:
+            rec["tokens"] = r["tokens"]
         if os.environ.get("HYBRID_LOG_QUERIES") == "1":
             rec["query"] = q
         _log_decision(rec)
