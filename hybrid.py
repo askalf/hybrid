@@ -91,6 +91,7 @@ any malformed response).
   HYBRID_LABEL_MARGIN        2.0 — winner must carry >= this x the runner-up's mass
 """
 import sys, os, time, json, re, threading, urllib.request, hashlib, math
+import contextvars
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from solver import solve
@@ -344,6 +345,43 @@ def _pin_slot(body, url, family):
         body["id_slot"] = h % n
 
 
+# ── Token accounting ─────────────────────────────────────────────────────────
+# Per-request tally of real token counts, read from the backends' own responses
+# (Ollama's eval counts, llama-server's tokens_evaluated/predicted, the frontier's
+# usage object) — the decision log gets measured spend, not a chars/4 estimate.
+# A ContextVar carries the tally down the call tree: server threads each handle
+# one request, so concurrent requests keep separate tallies, and the vote tiers
+# copy their context into worker threads so k samples add to the SAME request.
+_TOKENS = contextvars.ContextVar("hybrid_tokens", default=None)
+_TOKENS_LOCK = threading.Lock()
+
+
+def _tokens_reset():
+    """Start a fresh tally for the current request and return the (mutable) dict.
+    Outside a request — warmup, bare transport calls in tests — no tally exists
+    and _tokens_add is a no-op."""
+    t = {"local_in": 0, "local_out": 0, "local_calls": 0,
+         "frontier_in": 0, "frontier_out": 0, "frontier_calls": 0}
+    _TOKENS.set(t)
+    return t
+
+
+def _tokens_add(tier, n_in, n_out):
+    """Add one backend call's token counts to the current request's tally.
+    Backends that omit a count contribute 0 for it — the call is still counted."""
+    t = _TOKENS.get()
+    if t is None:
+        return
+    try:  # accounting must never break routing — garbage counts read as 0
+        n_in, n_out = int(n_in or 0), int(n_out or 0)
+    except (TypeError, ValueError):
+        n_in, n_out = 0, 0
+    with _TOKENS_LOCK:
+        t[tier + "_in"] += n_in
+        t[tier + "_out"] += n_out
+        t[tier + "_calls"] += 1
+
+
 def ollama(prompt, num_predict=256, temperature=0.0, model=None, grammar=None,
            family=None):
     """One local-model call (default LOCAL_MODEL; the vote/creative tiers pass
@@ -369,6 +407,7 @@ def ollama(prompt, num_predict=256, temperature=0.0, model=None, grammar=None,
             req = urllib.request.Request(url, data=body,
                                          headers={"content-type": "application/json"})
             r = json.loads(urllib.request.urlopen(req, timeout=300).read())
+            _tokens_add("local", r.get("prompt_eval_count"), r.get("eval_count"))
             return r.get("response", "").strip(), time.time() - t0
         except Exception as e:
             last = e
@@ -400,8 +439,9 @@ def _llamacpp_call(prompt, num_predict, temperature, grammar, model, family, ext
         try:
             req = urllib.request.Request(url, data=body,
                                          headers={"content-type": "application/json"})
-            return (json.loads(urllib.request.urlopen(req, timeout=300).read()),
-                    time.time() - t0)
+            r = json.loads(urllib.request.urlopen(req, timeout=300).read())
+            _tokens_add("local", r.get("tokens_evaluated"), r.get("tokens_predicted"))
+            return r, time.time() - t0
         except Exception as e:
             last = e
             if attempt == 1:
@@ -425,7 +465,10 @@ def escalate(query, messages=None):
     t0 = time.time()
     try:
         r = json.loads(urllib.request.urlopen(req, timeout=120).read())
-        return r["choices"][0]["message"]["content"].strip(), time.time() - t0
+        ans = r["choices"][0]["message"]["content"].strip()
+        u = r.get("usage") or {}
+        _tokens_add("frontier", u.get("prompt_tokens"), u.get("completion_tokens"))
+        return ans, time.time() - t0
     except Exception as e:
         raise BackendError("frontier", f"{FRONTIER_MODEL} at {FRONTIER_URL}: {e}")
 
@@ -474,7 +517,11 @@ def _vote(prompt, k, model, num_predict):
     and the instruction-following vote (route_messages, the CALLER's own prompt)."""
     t0 = time.time()
     with ThreadPoolExecutor(max_workers=k) as ex:
-        futures = [ex.submit(ollama, prompt, num_predict, 0.6, model) for _ in range(k)]
+        # copy_context per worker: the samples' token counts land on the tally of
+        # the REQUEST that voted (ContextVars don't cross threads by themselves).
+        futures = [ex.submit(contextvars.copy_context().run,
+                             ollama, prompt, num_predict, 0.6, model)
+                   for _ in range(k)]
         samples = [f.result()[0] for f in futures]
     t = time.time() - t0
     keys = [_key(s) for s in samples]
@@ -606,11 +653,17 @@ def route(query, messages=None):
     message — but an escalated call carries the whole conversation to the frontier.
     Never raises for a dead backend — the failure policy (env, read per-call so a
     live service can be re-tuned) turns a BackendError into either a degraded route
-    or an explicit ERROR result the caller can surface."""
+    or an explicit ERROR result the caller can surface.
+
+    The result carries `tokens` — the request's measured backend spend (see
+    _tokens_reset). SOLVED routes show all zeros: that IS the datapoint."""
+    t = _tokens_reset()
     try:
-        return _route(query, messages)
+        r = _route(query, messages)
     except BackendError as e:
-        return _apply_failure_policy(e, query, messages)
+        r = _apply_failure_policy(e, query, messages)
+    r["tokens"] = dict(t)
+    return r
 
 
 def _route(query, messages=None):
@@ -972,7 +1025,9 @@ def _route_messages_labeled(system, messages, user_text, oai, labels):
             k = 2 if os.environ.get("HYBRID_VOTE_FAST", "") == "1" else 3
             t0 = time.time()
             with ThreadPoolExecutor(max_workers=k) as ex:
-                futures = [ex.submit(ollama, prompt, 16, 0.6, LOCAL_MODEL_FAST,
+                # copy_context per worker — see _vote
+                futures = [ex.submit(contextvars.copy_context().run,
+                                     ollama, prompt, 16, 0.6, LOCAL_MODEL_FAST,
                                      grammar, fam)
                            for _ in range(k)]
                 picks = [_extract_label(f.result()[0], labels) for f in futures]
@@ -1017,21 +1072,22 @@ def route_messages(system, messages, max_tokens=512, labels=None):
         conversation to the frontier. This respects the instruction and never
         serves a low-confidence local answer — the frontier catches the hard ones.
 
-    Same dict shape and failure policy as route()."""
+    Same dict shape and failure policy as route(), including `tokens`."""
     user_text = _anthropic_user_text(messages)
     oai = _anthropic_to_openai(system, messages)
     labels = _clean_labels(labels)
-    if labels:
-        try:
-            return _route_messages_labeled(system, messages, user_text, oai, labels)
-        except BackendError as e:
-            return _apply_failure_policy(e, user_text, oai)
-    if not (system and str(system).strip()):
-        return route(user_text, oai)
+    if not labels and not (system and str(system).strip()):
+        return route(user_text, oai)          # route() keeps its own tally
+    t = _tokens_reset()
     try:
-        return _route_messages_instructed(system, messages, user_text, oai, max_tokens)
+        if labels:
+            r = _route_messages_labeled(system, messages, user_text, oai, labels)
+        else:
+            r = _route_messages_instructed(system, messages, user_text, oai, max_tokens)
     except BackendError as e:
-        return _apply_failure_policy(e, user_text, oai)
+        r = _apply_failure_policy(e, user_text, oai)
+    r["tokens"] = dict(t)
+    return r
 
 
 def _route_messages_instructed(system, messages, user_text, oai, max_tokens):

@@ -288,7 +288,10 @@ every response has `x_hybrid` (route / why / backend / latency) plus a chars/4 `
 estimate (flagged `usage_estimated` — the local tier isn't token-metered).
 
 Every request writes one **JSONL decision line** — route, why, backend, latency, status,
-a sha256 prefix of the query — to stdout (the banner goes to stderr) or to `HYBRID_LOG`.
+a sha256 prefix of the query, and `tokens`: the request's **measured token spend per
+tier** (`local_in/out/calls`, `frontier_in/out/calls`), read from the backends' own
+responses rather than estimated — a SOLVED route logs zeros, which is the point. The
+line goes to stdout (the banner goes to stderr) or to `HYBRID_LOG`.
 Query text stays out of the log unless `HYBRID_LOG_QUERIES=1`. A backend failure is a
 **502 with an OpenAI-shaped error object** (see failure policy), never error text
 disguised as an answer. `/health` reports liveness + version without auth; set

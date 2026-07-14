@@ -23,7 +23,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: compile everything
-        run: python -m py_compile hybrid.py solver.py verify.py equations.py server.py bench_offline.py bench_router.py measure_routing.py
+        run: python -m py_compile hybrid.py solver.py verify.py equations.py templates.py server.py bench_offline.py bench_router.py measure_routing.py
       - name: solver oracle (53)
         run: python test_solver.py
       - name: plug-back verifier (28)
@@ -34,8 +34,16 @@ jobs:
         run: python test_route.py
       - name: server surface (18)
         run: python test_server.py
+      - name: template transcriber (58)
+        run: python test_templates.py
+      - name: anthropic messages surface (32)
+        run: python test_messages.py
+      - name: llamacpp backend + grammars (64)
+        run: python test_backend.py
       - name: startup warmup primer
         run: python test_warmup.py
+      - name: token accounting
+        run: python test_tokens.py
 
   package:
     runs-on: ubuntu-latest

@@ -3,6 +3,22 @@
 All notable changes to hybrid are documented here. This project adheres to
 [Semantic Versioning](https://semver.org).
 
+## Unreleased
+
+**Token accounting — the decision log now records measured spend.** The log had
+latency but not tokens, so the savings thesis could not be quantified from real
+traffic. Every routed request now carries a `tokens` tally — `local_in/out/calls`
+and `frontier_in/out/calls` — read from the backends' own responses (Ollama's
+eval counts, llama-server's `tokens_evaluated`/`tokens_predicted`, the frontier's
+`usage` object), not estimated. The tally rides a ContextVar: concurrent server
+requests stay separate, and the vote tiers copy their context into worker threads
+so k samples land on the request that voted. A SOLVED route logs zeros — that is
+the datapoint. Accounting never breaks routing: garbage counts read as 0, and a
+call whose backend reports no usage still counts the call.
+
+Also: CI now runs the template-transcriber, Anthropic-messages, and llamacpp-backend
+suites (154 checks that previously only ran locally) and compiles `templates.py`.
+
 ## v1.12.0 — 2026-07-11
 
 **Logit-read classification — read the posterior, don't sample it.** The labelled
