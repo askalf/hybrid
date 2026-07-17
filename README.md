@@ -183,7 +183,11 @@ python test_templates.py                       # template transcriber tests (58/
 python test_verify.py                          # verifier tests (28/28, no model needed)
 python test_equations.py                       # setup re-derivation tests (45/45, no model needed)
 python test_route.py                           # router plumbing + failure policy + fused + load-shed (39/39, no model needed)
-python test_server.py                          # server surface: SSE, auth, limits, cache (22/22, no model needed)
+python test_server.py                          # server surface: SSE, auth, limits, cache (23/23, no model needed)
+python test_backend.py                         # llamacpp transport: grammars, slots, logit read (64/64, no model needed)
+python test_messages.py                        # Anthropic door + labelled classification (32/32, no model needed)
+python test_tokens.py                          # token accounting (14/14, no model needed)
+python test_warmup.py                          # startup warmup (9/9, no model needed)
 python bench_router.py                         # full-router benchmark: on-box %, safety, catches
 python measure_routing.py                      # router economics: $ saved vs all-frontier (needs FRONTIER_API_KEY)
 python hybrid.py "your question"               # route one query
@@ -192,7 +196,7 @@ python server.py                               # OpenAI-compatible server on :80
 ```
 
 The oracle tiers and both harnesses (router + server tests) need **nothing** — no model,
-no network — so all 325 tests run anywhere, including CI.
+no network — so all 365 tests run anywhere, including CI.
 
 ### The llama.cpp transport — the GPU-less fast path
 
@@ -303,6 +307,13 @@ served from memory in ~0 ms with `x_hybrid.cached: true` — real traffic repeat
 cache hit costs neither tokens nor bandwidth. Multi-turn requests, `ERROR` results, and
 `DEGRADED` answers are never cached; `HYBRID_CACHE_MAX` (default 512) caps entries, LRU.
 
+**Cold starts are optional.** On a CPU box, prefill is the compute-bound wall, so a
+freshly restarted server answers its opening traffic slowly until the prefix cache
+fills. `HYBRID_WARMUP=1` primes each fixed local tier's instruction preamble with one
+throwaway forward pass at boot — no routing, no frontier spend, and a cold backend
+never blocks startup. (The labelled-classifier preamble is caller-dependent and
+deliberately not warmed.)
+
 ### The Anthropic front door — `POST /v1/messages`
 
 Most fleets are **Anthropic-shaped** — inline `@anthropic-ai/sdk` `messages.create`
@@ -371,7 +382,7 @@ tiers answer in ~0 ms regardless, and `LOCAL_MODEL_FAST` roughly halves the vote
 tiers. Size expectations (and any reverse proxy timeouts) for the residual model-path
 queries accordingly.
 
-Deploying it: the **`Dockerfile`** is python-slim plus the five modules (with a
+Deploying it: the **`Dockerfile`** is python-slim plus the six modules (with a
 `/health` healthcheck); **`deploy/docker-compose.yml`** runs the whole local tier —
 ollama + hybrid — with the port published to loopback only; **`deploy/hybrid.service`**
 is a hardened systemd unit (`DynamicUser`, `ProtectSystem=strict`) where
@@ -397,6 +408,7 @@ is a hardened systemd unit (`DynamicUser`, `ProtectSystem=strict`) where
 | `HYBRID_LOG_QUERIES` | off | `1` = include query text in the decision log |
 | `HYBRID_CACHE_TTL` | `0` (off) | seconds to serve repeated single-turn queries from memory (~0 ms hits) |
 | `HYBRID_CACHE_MAX` | `512` | answer-cache entry cap, LRU-evicted |
+| `HYBRID_WARMUP` | off | `1` = prime each fixed local tier's instruction preamble at boot (one throwaway pass; fills the prefix cache) |
 | `HYBRID_SLOT_PIN` | `1` | llamacpp transport: pin prompt families to a server slot (needs `GET /slots`); `0` disables |
 | `HYBRID_LABEL_LOGITS` | `1` | labelled classification reads the first-token posterior (one pass) instead of voting; `0` = sampling vote |
 | `HYBRID_LABEL_MIN_P` | `0.4` | minimum posterior mass on the winning label to serve locally |
@@ -485,13 +497,15 @@ the line keeps moving; it doesn't disappear.
   (linear systems, Gaussian elimination over `Fraction`s); conservative
 - `verify.py` — verify-the-local-answer: re-derive the model's plugged-in checks exactly
 - `test_solver.py` / `test_templates.py` / `test_verify.py` / `test_equations.py` /
-  `test_route.py` / `test_server.py` — 227 tests (oracles + transcriber + router
-  plumbing + failure policy + server surface + cache); all offline, no model needed
+  `test_route.py` / `test_server.py` / `test_backend.py` / `test_messages.py` /
+  `test_tokens.py` / `test_warmup.py` — 365 tests (oracles + transcriber + router
+  plumbing + failure policy + server surface + cache + llamacpp transport + the
+  Anthropic door + token accounting + warmup); all offline, no model needed
 - `bench_offline.py` — what the solver buys versus a no-solver router (no model needed)
 - `bench_router.py` — full-router benchmark: on-box rate, on-box safety, catches (frontier stubbed)
 - `measure_routing.py` — router economics: prices every query's frontier cost to show real $ saved
-- `server.py` — OpenAI-compatible front end: SSE streaming, JSONL decision log, body
-  caps, optional bearer auth
+- `server.py` — OpenAI-compatible (and Anthropic-compatible) front end: SSE streaming,
+  JSONL decision log, body caps, optional bearer auth
 - `pyproject.toml` / `Dockerfile` / `deploy/` — pip/pipx packaging (console commands
   `hybrid` + `hybrid-server`), container image, compose + systemd examples
 
