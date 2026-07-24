@@ -150,15 +150,19 @@ list pricing ($3 / $15 per 1M); set `PRICE_IN_PER_M` / `PRICE_OUT_PER_M` for you
 
 ## Install
 
+**Not yet on PyPI.** `publish.yml` ships a release via Trusted Publishing (OIDC — no
+tokens anywhere) the moment PyPI has a pending-publisher binding registered for this
+repo; until then it fails closed on every release rather than claim success it didn't
+earn. Until that's done, install straight from the repo — same zero-dependency wheel,
+same console commands:
+
 ```bash
-pipx install hybrid-router       # console commands: hybrid, hybrid-server
-# or: pip install hybrid-router
-# or straight from the repo: pipx install git+https://github.com/askalf/hybrid
+pipx install git+https://github.com/askalf/hybrid   # console commands: hybrid, hybrid-server
+# or: pip install git+https://github.com/askalf/hybrid
 ```
 
 Zero runtime dependencies — the wheel is the six modules you can read above, installed
-exactly as they read. Published to PyPI from CI on every release via **Trusted
-Publishing** (OIDC — no tokens anywhere). `hybrid --version` tells you what you got.
+exactly as they read. `hybrid --version` tells you what you got.
 
 ## Run
 
