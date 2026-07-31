@@ -90,7 +90,7 @@ query → router ─┬─ solve:    arithmetic · unit conversion · %-change? 
    samples and the vote costs about one sample's wall time; unanimous → keep local,
    else escalate.
 
-## Measured (`bench_router.py`, 22-query labeled set, qwen2.5:7b)
+## Measured (`bench_router.py`, 22-query labeled set, qwen2.5:7b — run at v1.5.0)
 
 The real router over a labeled mix — closed-form, conversions, shaped word problems,
 factual, off-template confident-wrong arithmetic, hard, and setup traps. Frontier
@@ -105,7 +105,7 @@ ESCALATED:     5/22 routed to the frontier
 HONEST LIMIT:  0 setup traps slipped through local + wrong
 ```
 
-The line has moved three times now. v1.0.0: 15/20 on-box but **13/15 correct** — both
+The line moved three times across v1.0.0 → v1.5.0. v1.0.0: 15/20 on-box but **13/15 correct** — both
 documented setup traps served locally and *wrong*. v1.1.0: zero wrong served — the setup
 re-derivation tier caught Sally's-sisters and solved chicken-and-a-half, trading on-box
 points for safety. v1.5.0 moves it again in the other direction: the shaped word problems
@@ -129,6 +129,14 @@ The one wrong-served answer is the documented transcription-leak trap, which the
 templates correctly decline — the model-side limit is unchanged, just reached less often.
 **Where a small model stays confidently wrong even when it reasons well is exactly where
 a free exact oracle wins — and the strongest form of winning is never asking it.**
+
+> **Vintage.** Both benchmark blocks above were last run against v1.5.0. Releases
+> since then changed the transport and the classifier rather than the tier
+> boundaries — llama.cpp transport (v1.7.0), load shedding (v1.8.0), labelled and
+> then logit-read classification (v1.10.0, v1.12.0), slot pinning (v1.11.0),
+> startup warmup and token accounting (v1.13.0). Re-run `bench_router.py` and
+> `measure_routing.py` yourself for current numbers; the routing *shape* below is
+> what these figures are here to show.
 
 ## Measured economics (`measure_routing.py`, v1.0.0 routing mix)
 
