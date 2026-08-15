@@ -1,31 +1,39 @@
-# hybrid — local-first LLM routing with frontier escalation
+<div align="center">
+
+# hybrid
+
+**Own your inference: answer the easy majority of LLM queries on your own machine — free, private, exact — and escalate only the few that earn a frontier call.**
+
+Dependency-free Python. Built and measured on a GPU-less 2013 desktop.
 
 [![tests](https://github.com/askalf/hybrid/actions/workflows/test.yml/badge.svg)](https://github.com/askalf/hybrid/actions/workflows/test.yml)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/askalf/hybrid/badge)](https://scorecard.dev/viewer/?uri=github.com/askalf/hybrid)
 
-<p align="center">
-  <img src="https://raw.githubusercontent.com/askalf/hybrid/main/og.png" alt="hybrid: answer the easy majority locally, escalate the few that earn it" width="840">
-</p>
+[How it routes](#how-it-routes) · [Measured](#measured-bench_routerpy-22-query-labeled-set-qwen257b--run-at-v150) · [Economics](#measured-economics-measure_routingpy-v100-routing-mix) · [Install](#install) · [llama.cpp transport](#the-llamacpp-transport--the-gpu-less-fast-path) · [The server](#the-server-as-a-service) · [The honest part](#the-honest-part-what-this-taught-me)
 
-> _hybrid — **own your inference**. Part of **[Own Your Stack](https://github.com/askalf)** — own your AI infrastructure instead of renting it by the token._
+<img src="https://raw.githubusercontent.com/askalf/hybrid/main/og.png" alt="hybrid: answer the easy majority locally, escalate the few that earn it" width="840">
 
-Answer the easy majority of your LLM queries on your **own machine** — free, private,
-fast — and escalate only the genuinely hard ones to a **frontier model**. Most of what
-you ask an LLM is easy (facts, rewrites, simple Q&A, arithmetic); the rare hard query (a
-proof, real code, multi-step reasoning) goes to the frontier. Frontier quality where it
-matters; nothing paid or sent off your machine for the rest.
+</div>
 
-Dependency-free Python (stdlib only). Built and measured on a **GPU-less 2013 desktop** —
-the writeup, with all the numbers, is here:
-[**Your CPU isn't bad at LLMs — it's bandwidth-starved**](https://sprayberrylabs.com/blog/own-your-inference).
+---
 
-The hard part isn't routing the easy queries home — it's knowing when the cheap model is
-**confidently wrong**. A router built on the cheap model's own signals (classification,
-self-consistency) inherits its blind spots: it can't tell confident-and-right from
-confident-and-wrong. hybrid's answer is a **free verifier that is stronger than the
-model** — Python's exact arithmetic — applied at every depth it can reach: solve the
-closed forms outright, transcribe the *shaped* word problems deterministically, and
-re-derive the model's own working on everything else.
+## The result that reframes the problem
+
+*"Each crate weighs 23.7 kg. What do 41 crates weigh?"* — truth: **971.7**.
+
+| answerer | answer | cost |
+|---|---|---|
+| local `qwen2.5:7b` | 981.7 ✗ — caught by the verifier → escalated (working as designed) | 1 local call |
+| `claude-haiku-4-5` (a real frontier tier) | **972.17 ✗ — deterministically: 5/5 identical wrong answers** across resamples | 5 frontier calls |
+| **hybrid's template tier** | **971.7 ✓ exact** | **0 ms · zero model calls** |
+
+Reproduce the free row yourself: `python templates.py "Each crate weighs 23.7 kg. What do 41 crates weigh?"` → `('971.7', 'rate')`.
+
+*Scope, honestly:* one query class (rate × decimal quantity), one query × 5 samples, measured 2026-08-10, and the frontier tier was haiku — the cheap one — not a top-end model. Don't read it as "frontier models are bad at math." Read it as the thesis: **arithmetic execution is unreliable in language models generally — including the model you'd escalate to — so for the shapes you can recognize, don't ask a model at all. Compute it.** Escalation is a quality lever, not a guarantee.
+
+That's what hybrid is: a router whose strongest tiers are **not models** — exact arithmetic, deterministic transcription, and a free verifier stronger than any model on the slice it covers — with a local model for the middle and a frontier only for what genuinely earns it. Most of what you ask an LLM is easy; the writeup with all the numbers is [**Your CPU isn't bad at LLMs — it's bandwidth-starved**](https://sprayberrylabs.com/blog/own-your-inference).
+
+The hard part isn't routing the easy queries home — it's knowing when the cheap model is **confidently wrong**. A router built on the cheap model's own signals (classification, self-consistency) inherits its blind spots: it can't tell confident-and-right from confident-and-wrong. hybrid's answer is a **free verifier that is stronger than the model** — Python's exact arithmetic — applied at every depth it can reach: solve the closed forms outright, transcribe the *shaped* word problems deterministically, and re-derive the model's own working on everything else.
 
 ## How it routes
 
@@ -54,7 +62,7 @@ query → router ─┬─ solve:    arithmetic · unit conversion · %-change? 
    via `1 in = 25.4 mm` with `Fraction`s, never a float), **percentage-change**
    (`20% off 50 → 40`), and **multiples** (`half of 60 → 30`). Zero frontier calls, correct
    by construction. Strictly conservative — anything that doesn't reduce cleanly falls through.
-1. **Template transcriber** (`templates.py`, new in v1.5.0) — the derive tier's lesson,
+1. **Template transcriber** (`templates.py`) — the derive tier's lesson,
    inverted. The model's real job on a word problem is *transcription*, and transcription
    is the one surface the exact oracle cannot check — so for the shapes that dominate
    everyday quantitative queries, don't ask the model at all. Five rigid shapes (rate ×
@@ -68,7 +76,7 @@ query → router ─┬─ solve:    arithmetic · unit conversion · %-change? 
    hard-category rule — a clean exact parse beats a stray keyword.
 2. **Category rules** escalate domains a small model is *known* to fail (code, proofs, puzzles).
 3. **Open-ended rules** keep creative tasks (rewrite, summarize) local — no single right answer.
-4. **Setup re-derivation** (`equations.py`, new in v1.1.0) — for any *quantitative* query (a
+4. **Setup re-derivation** (`equations.py`) — for any *quantitative* query (a
    digit, or two number-words: "a chicken and **a half** lays an egg and **a half**…"), the
    model **transcribes the problem's relationships as equations** over named unknowns —
    transcription is an easier skill than solving — and we solve the linear system ourselves,
@@ -135,7 +143,7 @@ a free exact oracle wins — and the strongest form of winning is never asking i
 > boundaries — llama.cpp transport (v1.7.0), load shedding (v1.8.0), labelled and
 > then logit-read classification (v1.10.0, v1.12.0), slot pinning (v1.11.0),
 > startup warmup and token accounting (v1.13.0). Re-run `bench_router.py` and
-> `measure_routing.py` yourself for current numbers; the routing *shape* below is
+> `measure_routing.py` yourself for current numbers; the routing *shape* above is
 > what these figures are here to show.
 
 ## Measured economics (`measure_routing.py`, v1.0.0 routing mix)
@@ -169,7 +177,7 @@ pipx install git+https://github.com/askalf/hybrid   # console commands: hybrid, 
 # or: pip install git+https://github.com/askalf/hybrid
 ```
 
-Zero runtime dependencies — the wheel is the six modules you can read above, installed
+Zero runtime dependencies — the wheel is the modules you can read in this repo, installed
 exactly as they read. `hybrid --version` tells you what you got.
 
 ## Run
@@ -187,19 +195,9 @@ export FRONTIER_API_KEY=sk-...                                    # OpenAI, or y
 export FRONTIER_URL=https://api.openai.com/v1/chat/completions    # default; point anywhere OpenAI-compatible
 export FRONTIER_MODEL=gpt-4o                                      # default
 
-python solver.py "how many feet in 3 miles"   # the deterministic tier alone -> 15840
+python solver.py "how many feet in 3 miles"    # the deterministic tier alone -> 15840
 python templates.py "A printer prints 2,417 pages per hour. How many pages in 94 hours?"
                                                # the template transcriber alone -> ('227198', 'rate')
-python test_solver.py                          # solver tests (53/53, no model needed)
-python test_templates.py                       # template transcriber tests (58/58, no model needed)
-python test_verify.py                          # verifier tests (28/28, no model needed)
-python test_equations.py                       # setup re-derivation tests (45/45, no model needed)
-python test_route.py                           # router plumbing + failure policy + fused + load-shed (39/39, no model needed)
-python test_server.py                          # server surface: SSE, auth, limits, cache (23/23, no model needed)
-python test_backend.py                         # llamacpp transport: grammars, slots, logit read (64/64, no model needed)
-python test_messages.py                        # Anthropic door + labelled classification (32/32, no model needed)
-python test_tokens.py                          # token accounting (14/14, no model needed)
-python test_warmup.py                          # startup warmup (9/9, no model needed)
 python bench_router.py                         # full-router benchmark: on-box %, safety, catches
 python measure_routing.py                      # router economics: $ saved vs all-frontier (needs FRONTIER_API_KEY)
 python hybrid.py "your question"               # route one query
@@ -207,10 +205,12 @@ python hybrid.py --demo                        # mixed test set + summary
 python server.py                               # OpenAI-compatible server on :8080 (model "hybrid", stream ok)
 ```
 
-The oracle tiers and both harnesses (router + server tests) need **nothing** — no model,
-no network — so all 365 tests run anywhere, including CI.
+The oracle tiers and every test harness need **nothing** — no model, no network — so all
+**365 tests** run anywhere, including CI: `test_solver.py` 53 · `test_templates.py` 58 ·
+`test_verify.py` 28 · `test_equations.py` 45 · `test_route.py` 39 · `test_server.py` 23 ·
+`test_backend.py` 64 · `test_messages.py` 32 · `test_tokens.py` 14 · `test_warmup.py` 9.
 
-### The llama.cpp transport — the GPU-less fast path
+## The llama.cpp transport — the GPU-less fast path
 
 Ollama is the friendly default; llama.cpp's own server is the fast one. Point hybrid at
 a [`llama-server`](https://github.com/ggml-org/llama.cpp) and the router turns on four
@@ -250,11 +250,12 @@ export LOCAL_MODEL_FAST=qwen2.5:3b LLAMACPP_URL_FAST=http://127.0.0.1:8081/compl
   prompts land on k slots and prefill k times at once. The transport pins each **prompt
   family** (labelled classification: system prompt + label set) to one slot, so sample
   1 prefills, samples 2..k reuse the whole prompt, and the prefix stays hot for the
-  family's next request. Measured (3B, `--parallel 3`, six forge-shaped classify
+  family's next request. Measured (3B, `--parallel 3`, six dispatcher-shaped classify
   requests): cold 9434 → 3571 ms (**2.6×**), warm p50 3175 → 1623 ms (**2.0×**), with
   identical labels chosen — it moves work, it never changes answers. Applied only where
   decode is tiny (grammar-locked labels); long-decode votes still batch across slots.
   Needs `GET /slots` exposed (llama-server's default); `HYBRID_SLOT_PIN=0` disables.
+
 #### Same box, same GGUF, two transports (i7-4770 8-thread, qwen2.5:7b Q4_K_M, frontier stubbed)
 
 | transport | bench 22q on-box | bench safety | bench wall | stress 26q on-box | stress wrong-served | stress wall |
@@ -294,7 +295,7 @@ transcriber, which answer the shaped majority at 0 ms with no model in the loop 
 that, not benchmark luck, is the durable safety story. Bench tables should state the
 runtime; ours do.
 
-### The server, as a service
+## The server, as a service
 
 `server.py` speaks enough OpenAI protocol for real clients: **`stream: true` works**
 (SSE — role delta, one content delta, a stop chunk, `[DONE]`; the content arrives whole
@@ -394,11 +395,12 @@ tiers answer in ~0 ms regardless, and `LOCAL_MODEL_FAST` roughly halves the vote
 tiers. Size expectations (and any reverse proxy timeouts) for the residual model-path
 queries accordingly.
 
-Deploying it: the **`Dockerfile`** is python-slim plus the six modules (with a
+Deploying it: the **`Dockerfile`** is python-slim plus the modules (with a
 `/health` healthcheck); **`deploy/docker-compose.yml`** runs the whole local tier —
 ollama + hybrid — with the port published to loopback only; **`deploy/hybrid.service`**
 is a hardened systemd unit (`DynamicUser`, `ProtectSystem=strict`) where
-`journalctl -u hybrid` *is* the decision log.
+`journalctl -u hybrid` *is* the decision log. This compose shape is how we run it in
+production ourselves.
 
 ### Config (env)
 
@@ -508,11 +510,9 @@ the line keeps moving; it doesn't disappear.
 - `equations.py` — setup re-derivation: solve the model's transcribed equation system exactly
   (linear systems, Gaussian elimination over `Fraction`s); conservative
 - `verify.py` — verify-the-local-answer: re-derive the model's plugged-in checks exactly
-- `test_solver.py` / `test_templates.py` / `test_verify.py` / `test_equations.py` /
-  `test_route.py` / `test_server.py` / `test_backend.py` / `test_messages.py` /
-  `test_tokens.py` / `test_warmup.py` — 365 tests (oracles + transcriber + router
-  plumbing + failure policy + server surface + cache + llamacpp transport + the
-  Anthropic door + token accounting + warmup); all offline, no model needed
+- `test_*.py` — 365 tests (oracles + transcriber + router plumbing + failure policy +
+  server surface + cache + llamacpp transport + the Anthropic door + token accounting +
+  warmup); all offline, no model needed
 - `bench_offline.py` — what the solver buys versus a no-solver router (no model needed)
 - `bench_router.py` — full-router benchmark: on-box rate, on-box safety, catches (frontier stubbed)
 - `measure_routing.py` — router economics: prices every query's frontier cost to show real $ saved
@@ -520,10 +520,6 @@ the line keeps moving; it doesn't disappear.
   JSONL decision log, body caps, optional bearer auth
 - `pyproject.toml` / `Dockerfile` / `deploy/` — pip/pipx packaging (console commands
   `hybrid` + `hybrid-server`), container image, compose + systemd examples
-
-## License
-
-MIT
 
 ## Own Your Stack
 
@@ -543,4 +539,4 @@ Part of **[Own Your Stack](https://github.com/askalf)** — open tools for ownin
 - **[askalf](https://askalf.org)** — own your operation: the AI operation that runs Sprayberry Labs
 
 ---
-Part of **[Own Your Stack](https://github.com/askalf)** — own your AI infrastructure instead of renting it. Built by Thomas Sprayberry.
+Part of **[Own Your Stack](https://github.com/askalf)** — own your AI infrastructure instead of renting it by the token. Built by Thomas Sprayberry · MIT.
