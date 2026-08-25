@@ -3,6 +3,24 @@
 All notable changes to hybrid are documented here. This project adheres to
 [Semantic Versioning](https://semver.org).
 
+## v1.14.0 — 2026-08-25
+
+**Deterministic ownership tier for labelled classification
+(`metadata.hybrid_label_hints`).** Some labels are ownership facts, not semantics:
+"which agent owns this surface." A general small model cannot infer a roster fact —
+measured live on a deployed tuned classifier, it routed *"the discord bot stopped
+responding to slash commands"* to `monitor` at 0.98 posterior with the surface named
+in the message, and 6 of 14 on-box serves were wrong the same way. But the caller
+knows its roster, and these requests name their surface. A request may now declare a
+hint lexicon per label — `metadata.hybrid_label_hints: {"discord": ["discord",
+"slash command"], ...}` — and when exactly ONE label's lexicon matches the message
+(case-insensitive, word-boundary, phrases allowed), that label is served
+deterministically: `route=SOLVED`, `backend="lexicon (exact)"`, zero model calls,
+0 ms. Zero hits or a cross-label collision falls through to the measured logit-read
+path unchanged, so ambiguity degrades to the model's behavior, never to a guess.
+It is the router's founding rule — never ask a model something you can decide
+deterministically — applied to the label set itself.
+
 ## v1.13.0 — 2026-07-14
 
 **Startup warmup (`HYBRID_WARMUP=1`).** On a CPU box, prefill is the compute-bound

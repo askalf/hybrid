@@ -99,7 +99,7 @@ import equations
 import templates
 import verify
 
-__version__ = "1.13.0"
+__version__ = "1.14.0"
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # Windows cp1252 chokes on non-ASCII
@@ -908,6 +908,56 @@ def _clean_labels(labels):
     return out[:32]
 
 
+def _clean_label_hints(hints, labels):
+    """A request's declared hint lexicons (metadata.hybrid_label_hints) -> a clean
+    {label: [phrase, ...]} restricted to declared labels. Same philosophy as
+    _clean_labels: anything malformed degrades to {} (the tier just doesn't run),
+    never an error. Phrases are distinct non-empty single-line strings <= 64
+    chars, <= 32 per label."""
+    if not isinstance(hints, dict):
+        return {}
+    out = {}
+    declared = {l.lower(): l for l in labels}
+    for k, v in hints.items():
+        if not isinstance(k, str) or k.strip().lower() not in declared:
+            continue
+        if not isinstance(v, (list, tuple)):
+            continue
+        phrases = []
+        for ph in v:
+            if isinstance(ph, str):
+                ph = " ".join(ph.split())
+                if ph and len(ph) <= 64 and ph.lower() not in [x.lower() for x in phrases]:
+                    phrases.append(ph)
+        if phrases:
+            out[declared[k.strip().lower()]] = phrases[:32]
+    return out
+
+
+def _match_label_lexicon(text, hints):
+    """The deterministic OWNERSHIP tier for labelled classification. Some labels
+    are ownership facts, not semantics: 'which agent owns this surface'. A general
+    small model cannot infer a roster fact -- measured live, it routed 'the discord
+    bot stopped responding' to `monitor` at 0.91 with the surface named IN the
+    message -- but the caller can declare the surface's lexicon, and a whole-word
+    match is correct by construction, free, and 0 ms.
+
+    Returns (label, matched_phrase) when EXACTLY ONE label's lexicon matches the
+    text (case-insensitive, word-boundary, multi-word phrases allowed); otherwise
+    None -- zero hits or a cross-label collision both fall through to the model
+    path, so ambiguity degrades to the measured behavior, never to a guess."""
+    hit = {}
+    for label, phrases in hints.items():
+        for ph in phrases:
+            pat = r"(?<![A-Za-z0-9])" + re.escape(ph) + r"(?![A-Za-z0-9])"
+            if re.search(pat, text or "", re.IGNORECASE):
+                hit[label] = ph
+                break
+    if len(hit) == 1:
+        return next(iter(hit.items()))
+    return None
+
+
 def _labels_grammar(labels):
     """GBNF forcing the local model to emit EXACTLY one of the labels (llamacpp
     transport only — the Ollama generate API ignores it, and we extract the label
@@ -1050,7 +1100,7 @@ def _route_messages_labeled(system, messages, user_text, oai, labels):
             "answer": ans, "router_s": round(ct, 2), "answer_s": round(dt, 2)}
 
 
-def route_messages(system, messages, max_tokens=512, labels=None):
+def route_messages(system, messages, max_tokens=512, labels=None, label_hints=None):
     """Route an Anthropic-style request. Three modes:
 
       - LABELLED (metadata.hybrid_labels declares an allowed label set): a
@@ -1081,7 +1131,22 @@ def route_messages(system, messages, max_tokens=512, labels=None):
     t = _tokens_reset()
     try:
         if labels:
-            r = _route_messages_labeled(system, messages, user_text, oai, labels)
+            # Deterministic ownership tier first (metadata.hybrid_label_hints):
+            # a unique lexicon hit is a roster fact stated in the message itself,
+            # so it outranks any model opinion -- 0 ms, no forward pass, and the
+            # exact class of confidently-wrong misroute a general model produces
+            # on ownership labels cannot occur. Zero or ambiguous hits fall
+            # through to the measured model path unchanged.
+            hints = _clean_label_hints(label_hints, labels)
+            lex = _match_label_lexicon(user_text, hints) if hints else None
+            if lex:
+                label, phrase = lex
+                r = {"route": "SOLVED",
+                     "why": 'label lexicon: "%s" of %d' % (phrase, len(labels)),
+                     "backend": "lexicon (exact)", "answer": label,
+                     "router_s": 0.0, "answer_s": 0.0}
+            else:
+                r = _route_messages_labeled(system, messages, user_text, oai, labels)
         else:
             r = _route_messages_instructed(system, messages, user_text, oai, max_tokens)
     except BackendError as e:
