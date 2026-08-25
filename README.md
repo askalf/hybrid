@@ -374,6 +374,29 @@ Measured live, grammar-locked, on a real 3B over `["build","research","monitor",
 `research` — every one on-box, unanimous, and guaranteed in-set. The model **cannot**
 return a category you didn't ask for.
 
+**Enumerate your labels in the system prompt too — this is not optional.**
+`metadata.hybrid_labels` grammar-locks the *output* and enables the posterior read,
+but the model still has to know what it is choosing between: that comes from your
+prompt, not from the metadata. Measured on the deployed gateway, same label set in
+both arms, only the system prompt differing:
+
+| system prompt | first-token posterior | routed |
+|---|---|---|
+| `"Classify into ONE category."` | 0.03 – 0.11 | **0/4 on-box — everything escalated** |
+| labels enumerated + *"reply with ONLY the category word"* | 0.91 – 0.98 | **4/4 on-box, ~0.2 s** |
+
+The failure is silent and it is expensive: a diffuse posterior is *correctly* treated
+as low confidence, so every request escalates and you pay frontier prices for the
+whole classification workload — the exact opposite of the point. If your on-box rate
+for a labelled workload is near zero, check the prompt before the model.
+
+**The in-set guarantee is an ON-BOX guarantee.** A locally served label is provably one
+you declared — grammar-locked and read off the posterior. An *escalated* one is not:
+escalation forwards your conversation to the frontier, which answers under your prompt
+like any other request. With the prompt above it returns the category word; with a weak
+prompt it returned 1,951 characters of prose in the same test. If you parse the reply,
+parse defensively and treat an unrecognized answer as "no classification."
+
 **Ownership labels are facts, not semantics — declare them.** Some label sets encode
 *who owns a surface* ("discord things go to the Discord manager"), and a general
 model cannot infer that roster fact: measured live, a tuned classifier routed *"the
