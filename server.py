@@ -292,7 +292,13 @@ class H(BaseHTTPRequestHandler):
         # served only as a unanimous in-set label. The reliable path for classifiers.
         meta = req.get("metadata")
         labels = meta.get("hybrid_labels") if isinstance(meta, dict) else None
-        r = hybrid.route_messages(system, messages, max_tokens=max_tokens, labels=labels)
+        # metadata.hybrid_label_hints ({label: [phrase, ...]}) arms the deterministic
+        # ownership tier: a unique whole-word lexicon hit serves that label with no
+        # model call at all. Ownership labels ("which agent owns this surface") are
+        # roster facts a general model cannot infer; the caller declares them instead.
+        label_hints = meta.get("hybrid_label_hints") if isinstance(meta, dict) else None
+        r = hybrid.route_messages(system, messages, max_tokens=max_tokens, labels=labels,
+                                  label_hints=label_hints)
 
         xh = {"route": r["route"], "why": r["why"], "backend": r["backend"],
               "latency_s": round(r["router_s"] + r["answer_s"], 2), "usage_estimated": True}

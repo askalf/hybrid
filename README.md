@@ -374,6 +374,20 @@ Measured live, grammar-locked, on a real 3B over `["build","research","monitor",
 `research` — every one on-box, unanimous, and guaranteed in-set. The model **cannot**
 return a category you didn't ask for.
 
+**Ownership labels are facts, not semantics — declare them.** Some label sets encode
+*who owns a surface* ("discord things go to the Discord manager"), and a general
+model cannot infer that roster fact: measured live, a tuned classifier routed *"the
+discord bot stopped responding to slash commands"* to `monitor` at 0.98 posterior —
+confidently wrong, with the answer named in the message. So a request may also
+declare `metadata.hybrid_label_hints: {"discord": ["discord", "slash command"],
+"cloudflare": ["dns", "cdn", "cloudflare"]}`. When exactly one label's lexicon
+matches the message (case-insensitive, whole-word, phrases allowed), hybrid serves
+that label **deterministically** — `SOLVED`, zero model calls, 0 ms, correct by
+construction. Zero hits, or a hit on two labels, falls through to the model path
+unchanged: ambiguity degrades to measured behavior, never to a guess. It's the same
+rule the arithmetic tiers are built on — never ask a model something you can decide
+deterministically — applied to the label set itself.
+
 **Read the posterior, don't sample it.** On the llama.cpp transport the vote itself is
 now the fallback: the label set is enumerable, so hybrid reads the model's OWN
 first-token probability distribution over it (one forward pass, `n_probs`) and serves

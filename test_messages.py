@@ -183,6 +183,56 @@ def main():
     check("labelled: malformed labels -> plain instruction-following path",
           r["route"] == "LOCAL" and "instruction self-consistent" in r["why"], r["why"])
 
+    # --- 6c. deterministic ownership tier (metadata.hybrid_label_hints) ---------
+    HINTS = {"discord": ["discord", "slash command", "channel"],
+             "cloudflare": ["cloudflare", "dns", "cdn", "cf access", "tunnel"]}
+    check("_clean_label_hints: restricts to declared labels, caps + dedupes",
+          hybrid._clean_label_hints({"discord": ["Discord", "discord", "", 7], "junk": ["x"],
+                                     "cloudflare": "not-a-list"},
+                                    ["discord", "cloudflare"]) == {"discord": ["Discord"]})
+    check("_clean_label_hints: non-dict -> {}",
+          hybrid._clean_label_hints(["discord"], ["discord"]) == {})
+    check("_match_label_lexicon: unique hit -> (label, phrase)",
+          hybrid._match_label_lexicon("the discord bot stopped responding to slash commands",
+                                      HINTS) == ("discord", "discord"))
+    check("_match_label_lexicon: case-insensitive whole word",
+          hybrid._match_label_lexicon("purge the CDN cache after deploy", HINTS)
+          == ("cloudflare", "cdn"))
+    check("_match_label_lexicon: multi-word phrase matches",
+          hybrid._match_label_lexicon("the CF Access policy blocks the dashboard", HINTS)
+          == ("cloudflare", "cf access"))
+    check("_match_label_lexicon: substring is NOT a word (discordant != discord)",
+          hybrid._match_label_lexicon("the results were discordant", HINTS) is None)
+    check("_match_label_lexicon: cross-label collision -> None (ambiguity never guesses)",
+          hybrid._match_label_lexicon("post the DNS change to the discord channel", HINTS) is None)
+    check("_match_label_lexicon: zero hits -> None",
+          hybrid._match_label_lexicon("add retry logic to the ollama transport", HINTS) is None)
+
+    # unique lexicon hit -> SOLVED, and NEITHER model NOR frontier is touched
+    v, f = Vote(fixed="build"), Frontier()
+    r = with_fakes(v, f, lambda: hybrid.route_messages(
+        CLASSIFY_SYS, [{"role": "user", "content": "the discord bot ignores slash commands"}],
+        labels=["build", "monitor", "discord", "cloudflare"], label_hints=HINTS))
+    check("lexicon tier: unique hit -> SOLVED, zero model calls, zero frontier calls",
+          r["route"] == "SOLVED" and r["answer"] == "discord" and "label lexicon" in r["why"]
+          and r["backend"] == "lexicon (exact)" and v.prompts == [] and f.calls == 0, r["why"])
+
+    # ambiguous hit -> the measured model path takes over unchanged
+    v, f = Vote(fixed="discord"), Frontier()
+    r = with_fakes(v, f, lambda: hybrid.route_messages(
+        CLASSIFY_SYS, [{"role": "user", "content": "post the dns change to the discord channel"}],
+        labels=["build", "monitor", "discord", "cloudflare"], label_hints=HINTS))
+    check("lexicon tier: cross-label hit falls through to the labelled model path",
+          r["route"] == "LOCAL" and "label self-consistent" in r["why"] and len(v.prompts) > 0, r["why"])
+
+    # hints for undeclared labels are ignored; matcher never fires
+    v, f = Vote(fixed="build"), Frontier()
+    r = with_fakes(v, f, lambda: hybrid.route_messages(
+        CLASSIFY_SYS, [{"role": "user", "content": "the discord bot is down"}],
+        labels=["build", "monitor"], label_hints=HINTS))
+    check("lexicon tier: hints outside the declared label set are inert",
+          r["route"] == "LOCAL" and "label self-consistent" in r["why"], r["why"])
+
     # --- 7. the live endpoint over real loopback HTTP ---------------------------
     os.environ["HYBRID_API_KEY"] = "msg-secret"
     hybrid.ollama, hybrid.escalate = Vote(fixed="build"), Frontier("build")
@@ -214,6 +264,17 @@ def main():
         check("metadata.hybrid_labels routes the labelled path, serves an in-set label",
               code == 200 and j["content"][0]["text"] == "build"
               and "label self-consistent" in j["x_hybrid"]["why"], j.get("x_hybrid"))
+
+        # metadata.hybrid_label_hints -> the deterministic ownership tier, end to end
+        hbody = {**body,
+                 "messages": [{"role": "user", "content": "the discord bot stopped responding"}],
+                 "metadata": {"hybrid_labels": ["build", "discord"],
+                              "hybrid_label_hints": {"discord": ["discord"]}}}
+        code, j = call("/v1/messages", hbody, {"content-type": "application/json", "x-api-key": "msg-secret"})
+        check("metadata.hybrid_label_hints serves the ownership label deterministically",
+              code == 200 and j["content"][0]["text"] == "discord"
+              and "label lexicon" in j["x_hybrid"]["why"]
+              and j["x_hybrid"]["route"] == "SOLVED", j.get("x_hybrid"))
 
         code, _ = call("/v1/messages", body, {"content-type": "application/json", "x-api-key": "wrong"})
         check("bad x-api-key -> 401", code == 401, code)
