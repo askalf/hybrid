@@ -14,10 +14,7 @@ Area labels are applied automatically from the paths you touched
 
 ## How it was verified
 
-<!-- Commands run and what they printed. For a detector change, say what the
-     verdict was before and after on real input — a scanner people trust cannot
-     change verdicts on an argument alone. -->
+<!-- Commands run and what they printed. Claims about behaviour need evidence:
+     "it works" is not a result, and a reviewer cannot re-derive one. -->
 
-- [ ] `npm test`
-- [ ] Detection change? Verdicts before/after are stated above, on real input.
-- [ ] Acceptance change? `support/watch-accept.mjs` output pasted, with a `class` and a `note` saying what was read.
+- [ ] `pytest` passes

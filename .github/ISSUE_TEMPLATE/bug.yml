@@ -2,13 +2,6 @@ name: Bug report
 description: hybrid did something other than what it says it does.
 labels: ['bug']
 body:
-  - type: markdown
-    attributes:
-      value: |
-        For a **missed injection** or a **wrong flag**, please use the
-        false-positive template or the security advisory link instead — those
-        need different information than a crash does.
-
   - type: textarea
     id: what
     attributes:
@@ -46,7 +39,7 @@ body:
   - type: input
     id: env
     attributes:
-      label: OS and Node version
-      placeholder: 'macOS 15.2, node 22.11.0'
+      label: OS and Python version
+      placeholder: 'Ubuntu 24.04, Python 3.12.5'
     validations:
       required: true
