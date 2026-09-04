@@ -1,0 +1,65 @@
+# Path → label map for .github/workflows/pr-triage.yml (actions/labeler v7).
+#
+# Additive only: sync-labels is off, so nothing here ever strips a label a
+# human — or Dependabot — put on a PR by hand. Add a path, get a label.
+#
+# Bare-noun labels, matching the Own Your Stack family vocabulary (redstamp is
+# the reference), so a reader moving between repos sees the same words.
+
+# hybrid is Python: the router, the solver and the equation layer are the
+# product; the tests sit beside them at the repo root rather than in test/.
+
+router:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'hybrid.py'
+          - 'measure_routing.py'
+          - 'server.py'
+
+solver:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'solver.py'
+          - 'equations.py'
+          - 'templates.py'
+
+verify:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'verify.py'
+
+deploy:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'deploy/**'
+          - 'Dockerfile'
+          - '.dockerignore'
+
+bench:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'bench_offline.py'
+          - 'bench_router.py'
+
+tests:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'test_*.py'
+
+github_actions:
+  - changed-files:
+      - any-glob-to-any-file:
+          - '.github/workflows/**'
+          - '.github/labeler.yml'
+
+documentation:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'README.md'
+          - 'CHANGELOG.md'
+          - 'CONTRIBUTING.md'
+          - 'CODE_OF_CONDUCT.md'
+          - 'SECURITY.md'
+          - '.github/ISSUE_TEMPLATE/**'
+          - '.github/pull_request_template.md'
+
