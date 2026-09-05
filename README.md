@@ -436,8 +436,11 @@ Deploying it: the **`Dockerfile`** is python-slim plus the modules (with a
 `/health` healthcheck); **`deploy/docker-compose.yml`** runs the whole local tier —
 ollama + hybrid — with the port published to loopback only; **`deploy/hybrid.service`**
 is a hardened systemd unit (`DynamicUser`, `ProtectSystem=strict`) where
-`journalctl -u hybrid` *is* the decision log. This compose shape is how we run it in
-production ourselves.
+`journalctl -u hybrid` *is* the decision log. This compose shape is how it ran on our
+own box from June to September 2026 (a 2013-era CPU host, gateway + llama.cpp fast tier
+under compose, 400 logged decisions) before we retired that deployment — the only
+caller was a chat-message classifier that never saw real traffic. The measurements in
+this README come from that period.
 
 ### Config (env)
 
